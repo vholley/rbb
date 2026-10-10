@@ -1,0 +1,14 @@
+{
+  "name": "rbb",
+  "description": "RBB, Record Before Build: a Claude Code plugin. Agree what will change before the agent builds it, then check the code against that record, not against the agent's report.",
+  "owner": {
+    "name": "V Holley"
+  },
+  "plugins": [
+    {
+      "name": "rbb",
+      "source": "./plugin",
+      "description": "Record Before Build: one page you approve, frozen before the build; a build held to it; a check by an agent that never met the builder; the page beside the code in the pull request."
+    }
+  ]
+}

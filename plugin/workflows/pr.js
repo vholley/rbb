@@ -1,0 +1,1071 @@
+export const meta = {
+  name: 'pr',
+  description: 'RBB: commit the check and the review, and write the pull request body as .rbb/<change>/pr.md, filled into the project template. Posts nothing.',
+  whenToUse: 'Started by the /rbb:pr skill after a check; not for direct use.',
+  phases: [
+    { title: 'Facts', detail: 'git facts relayed twice; the check must cover the current code' },
+    { title: 'Commit', detail: 'check.json and review.md committed and verified from git' },
+    { title: 'Body', detail: 'the short body written by code into the project template, saved and read back' },
+  ],
+}
+
+// <pure> -- deterministic functions only; unit-tested by tests/check/unit.mjs with no model.
+
+// <lib:spec> copied from src/lib/spec.js by tools/sync-lib.mjs; edit the source, not this copy
+// The goal and spec formats (docs/spec-format.md) and their validation. Pure functions only.
+// Workflow scripts cannot import, so this file is copied into a marked region of each workflow
+// that needs it by tools/sync-lib.mjs; tests/check/unit.mjs fails if any copy differs.
+
+const SPEC_V = 1
+const ID = { E: /^E\d+$/, C: /^C\d+$/, O: /^O\d+$/, X: /^X\d+$/, D: /^D\d+$/, P: /^P\d+$/ }
+const DECIDED_BY = ['requester', 'model']
+const BASES = ["requester's answer", 'goal', 'constraint', 'project convention', 'smallest change']
+
+// Documents mode (architecture 9.1): committed (default) or none, from .rbb/config.json.
+const documentsMode = config => (config && config.documents === 'none' ? 'none' : 'committed')
+// In mode none, .rbb/.gitignore ignores every file in .rbb/, itself included, so nothing is committed.
+const NONE_GITIGNORE = '*\n'
+// Mode none freezes the approved spec by git's blob id of each of its files, kept in approval.json.
+function approvalProblems(a, change) {
+  if (!a || a.v !== 1) return ['approval.json: expected {"v": 1, ...}']
+  const errs = []
+  if (a.change !== change) errs.push(`approval.json: change is ${a.change}, expected ${change}`)
+  // The hashed files are the spec's files as its manifest named them when it was approved: always
+  // spec.json, and the parts that existed then (advocate.json came later).
+  const files = a.hashes && typeof a.hashes === 'object' ? Object.keys(a.hashes) : []
+  if (!files.includes('spec.json') || files.some(f => !SPEC_FILES.includes(f) || !/^[0-9a-f]{40}$/.test(a.hashes[f] || ''))) errs.push(`approval.json: hashes must give the git blob id of spec.json and of each file it names, among ${SPEC_FILES.join(', ')}`)
+  if (!/^[0-9a-f]{40}$/.test(a.base || '')) errs.push('approval.json: base must be a commit id')
+  return errs
+}
+// The spec files an approval froze, in their fixed order: what to hash again to compare.
+const hashedFiles = approval => SPEC_FILES.filter(f => approval && approval.hashes && f in approval.hashes)
+// What counts as an alternative, for every agent that records a decision.
+const REAL_ALTERNATIVE = 'each option a competent developer could defensibly have taken instead: one that still meets the goal, every constraint and every example. An option that would break any of them is not an alternative, nor is the plain opposite of the choice unless doing nothing is itself defensible. If the only reason against it is that it would be wrong, broken or inaccurate, it was never a real option: leave it out. Give why it was not taken: a trade-off, not a defect. Empty when there is none'
+const CHANGES = ['edit', 'add', 'new file', 'delete']
+
+const isStr = v => typeof v === 'string' && v.trim().length > 0
+
+// The goal half, shared by a goal and a spec: the outcome, its examples, constraints, exclusions
+// and agreed extras. Appends to errs; returns the item ids it found.
+function goalItems(o, errs) {
+  const list = (k, re, fields) => {
+    if (!Array.isArray(o[k])) { errs.push(`${k}: must be a list`); return [] }
+    o[k].forEach((it, n) => {
+      if (!it || !re.test(it.id || '')) errs.push(`${k}[${n}]: bad id ${it && it.id}`)
+      for (const f of fields) if (!isStr(it && it[f])) errs.push(`${k}[${n}] ${it && it.id}: missing ${f}`)
+    })
+    return o[k].map(it => it && it.id)
+  }
+  if (!isStr(o.goal)) errs.push('goal: missing')
+  const ids = [
+    ...list('done_when', ID.E, ['text']),
+    ...list('constraints', ID.C, ['text']),
+    ...list('out_of_scope', ID.O, ['text']),
+    // Agreed extras are optional: specs written before they existed stay valid.
+    ...(o.agreed_extras === undefined ? [] : list('agreed_extras', ID.X, ['text', 'why'])),
+  ]
+  if (Array.isArray(o.done_when) && o.done_when.length === 0) errs.push('done_when: at least one example')
+  return ids
+}
+
+// A shaped goal, before any code is explored: what the requester approves first.
+// questions holds what only the requester can answer; a goal is ready only when it is empty.
+function validateGoal(g) {
+  if (!g || typeof g !== 'object') return ['goal: not an object']
+  const errs = []
+  if (g.v !== SPEC_V) errs.push(`v: expected ${SPEC_V}`)
+  if (!isStr(g.title)) errs.push('title: missing')
+  if (!isStr(g.source_request)) errs.push('source_request: missing')
+  const ids = goalItems(g, errs)
+  // Other goals found in the same request, each to be shaped as its own change. Optional.
+  if (g.split_off !== undefined && !(Array.isArray(g.split_off) && g.split_off.every(x => isStr(x && x.goal)))) errs.push('split_off: must be a list of {goal}')
+  if (!Array.isArray(g.questions)) errs.push('questions: must be a list (empty when nothing is open)')
+  else g.questions.forEach((q, n) => { if (!isStr(q && q.question)) errs.push(`questions[${n}]: missing question`) })
+  if (Array.isArray(g.questions)) errs.push(...questionProblems(g.questions, true))
+  const dup = ids.filter((x, n) => ids.indexOf(x) !== n)
+  if (dup.length) errs.push(`duplicate ids: ${[...new Set(dup)].join(', ')}`)
+  return errs
+}
+
+// A question to the requester carries the real answers (options, each with what it would mean for
+// the change), the recommended one, why (in terms of the request), and what the answer changes
+// elsewhere: a recommendation acts as a default, and the reason is what lets a person see a wrong
+// one. Goals written before the options existed hold only question and recommendation; they stay
+// valid (lenient) but a new draft must have the full shape (strict).
+function questionProblems(questions, lenient = false) {
+  const errs = []
+  ;(questions || []).forEach((q, n) => {
+    const at = `questions[${n}]`
+    if (!q) return
+    if (q.options === undefined) { if (!lenient) errs.push(`${at}: options missing; list the real answers, each with what it means`); return }
+    if (!Array.isArray(q.options) || q.options.length < 2 || q.options.some(o => !o || !isStr(o.option) || !isStr(o.means))) errs.push(`${at}: options must list at least two {option, means}`)
+    else if (!q.options.some(o => o.option === q.recommendation)) errs.push(`${at}: recommendation must be one of the options, word for word`)
+    if (!isStr(q.because)) errs.push(`${at}: because missing; say why the recommended option, in terms of the request`)
+    if (typeof q.affects !== 'string') errs.push(`${at}: affects must be a string (empty when the answer changes nothing else)`)
+  })
+  return errs
+}
+
+function goalReady(g) {
+  return validateGoal(g).length === 0 && g.questions.length === 0
+}
+
+function validateSpec(spec, change) {
+  if (!spec || typeof spec !== 'object') return ['spec: not an object']
+  const errs = []
+  if (spec.v !== SPEC_V) errs.push(`v: expected ${SPEC_V}`)
+  if (spec.change !== change) errs.push(`change: expected ${change}, found ${spec.change}`)
+  if (!/^[0-9a-f]{7,40}$/.test(spec.base || '')) errs.push('base: must be a commit id')
+  const ids = goalItems(spec, errs)
+  if (!Array.isArray(spec.decisions)) errs.push('decisions: must be a list')
+  else spec.decisions.forEach((d, n) => {
+    if (!d || !ID.D.test(d.id || '')) errs.push(`decisions[${n}]: bad id ${d && d.id}`)
+    for (const f of ['choice', 'because']) if (!isStr(d && d[f])) errs.push(`decisions[${n}] ${d && d.id}: missing ${f}`)
+    if (!d) return
+    ids.push(d.id)
+    // Who decided is optional until the specify workflow stamps it; when present it must be well formed.
+    const w = d.decided_by
+    if (w !== undefined) {
+      if (!w || !DECIDED_BY.includes(w.by)) errs.push(`${d.id}: decided_by.by must be one of ${DECIDED_BY.join(', ')}`)
+      else if (w.by === 'model' && !isStr(w.model)) errs.push(`${d.id}: decided_by.model is required when a model decided`)
+      if (w && w.basis !== undefined && !BASES.includes(w.basis)) errs.push(`${d.id}: decided_by.basis must be one of ${BASES.join(', ')}`)
+    }
+    if (d.related !== undefined && !(Array.isArray(d.related) && d.related.every(r => ID.D.test(r || '')))) errs.push(`${d.id}: related must list decision ids`)
+    if (d.alternatives !== undefined && !(Array.isArray(d.alternatives) && d.alternatives.every(a => a && isStr(a.option) && typeof a.why_not === 'string'))) errs.push(`${d.id}: alternatives must list {option, why_not}`)
+  })
+  if (!spec.plan || !Array.isArray(spec.plan.steps) || spec.plan.steps.length === 0) errs.push('plan.steps: at least one step')
+  else spec.plan.steps.forEach((s, n) => {
+    if (!ID.P.test(s.id || '')) errs.push(`plan.steps[${n}]: bad id`)
+    if (!isStr(s.does)) errs.push(`${s.id}: missing does`)
+    if (!Array.isArray(s.serves) || s.serves.some(x => !ids.includes(x))) errs.push(`${s.id}: serves must name existing items`)
+    if (!Array.isArray(s.locations) || s.locations.length === 0) errs.push(`${s.id}: at least one location`)
+    else s.locations.forEach((l, k) => {
+      if (!isStr(l.file)) errs.push(`${s.id}.locations[${k}]: missing file`)
+      if (!CHANGES.includes(l.change)) errs.push(`${s.id}.locations[${k}]: change must be one of ${CHANGES.join(', ')}`)
+      const needsLines = l.change === 'edit' || l.change === 'add'
+      if (needsLines && !(l.lines && Number.isInteger(l.lines.start) && Number.isInteger(l.lines.end) && l.lines.start >= 0 && l.lines.end >= l.lines.start)) errs.push(`${s.id}.locations[${k}]: lines {start,end} required for ${l.change}`)
+    })
+  })
+  const all = ids.concat((spec.plan && spec.plan.steps || []).map(s => s.id))
+  const dup = all.filter((x, n) => all.indexOf(x) !== n)
+  if (dup.length) errs.push(`duplicate ids: ${[...new Set(dup)].join(', ')}`)
+  return errs
+}
+
+// Pages are generated by code, never written by a model (architecture 5.2). They are for people,
+// so they never show ID codes: an item is referred to by its kind and its visible number,
+// such as "example 3", and listed under its heading with that number.
+const KIND = { E: ['example', 'examples'], C: ['constraint', 'constraints'], O: ['exclusion', 'exclusions'], X: ['agreed extra', 'agreed extras'], D: ['decision', 'decisions'], P: ['step', 'steps'] }
+const num = id => Number(String(id).slice(1))
+
+// "Examples 1–5; constraint 2; decision 6": grouped by kind, consecutive numbers as ranges.
+function refs(ids) {
+  const out = []
+  for (const k of Object.keys(KIND)) {
+    const ns = [...new Set(ids.filter(id => String(id)[0] === k).map(num))].sort((a, b) => a - b)
+    if (!ns.length) continue
+    const spans = []
+    for (const n of ns) {
+      const last = spans[spans.length - 1]
+      if (last && n === last[1] + 1) last[1] = n
+      else spans.push([n, n])
+    }
+    const text = spans.map(([a, b]) => (a === b ? `${a}` : b === a + 1 ? `${a}, ${b}` : `${a}–${b}`)).join(', ')
+    out.push(`${KIND[k][ns.length > 1 ? 1 : 0]} ${text}`)
+  }
+  const joined = out.join('; ')
+  return joined ? joined[0].toUpperCase() + joined.slice(1) : ''
+}
+
+const oneLine = v => String(v === undefined || v === null ? '' : v).replace(/\n+/g, ' ')
+const cell = v => oneLine(v).replace(/\|/g, '\\|')
+function table(headers, rows) {
+  return rows.length ? [`| ${headers.join(' | ')} |`, `|${headers.map(() => '---').join('|')}|`, ...rows.map(r => `| ${r.map(cell).join(' | ')} |`)].join('\n') : 'None.'
+}
+// A numbered list whose numbers are the items' own, so "example 3" is the line numbered 3.
+function items(list, withWhy) {
+  return list.length ? list.map(i => `${num(i.id)}. ${oneLine(i.text)}${withWhy && i.why ? ` *Why: ${oneLine(i.why)}*` : ''}`).join('\n') : 'None.'
+}
+
+// The request as written: a plain quoted section, last on the page, readable in any markdown viewer.
+// Its heading is fixed so the reading-length check can leave it out, as is the Examined list's.
+const REQUEST_HEADING = '## The request as written'
+const EXAMINED_HEADING = '## Examined'
+const FOLLOW_UPS_HEADING = '## Found along the way, not part of this change'
+const IMPACT_HEADING = '## What the change touches'
+const bullets = (list, f = x => oneLine(x)) => (list && list.length ? list.map(x => `- ${f(x)}`).join('\n') : 'None.')
+
+// The prose a person must read before approving, for the reading-length limit (the old RBB's rule:
+// not counting code, tables, the alternatives considered or the Examined list). Left out: the
+// reference sections (what the change touches, what was examined, the request as written), tables,
+// and sub-bullets (evidence, alternatives considered, who decided).
+function readingText(page) {
+  const skip = new Set([IMPACT_HEADING, EXAMINED_HEADING, REQUEST_HEADING])
+  const out = []
+  let skipping = false
+  for (const line of String(page).split('\n')) {
+    if (/^## /.test(line)) skipping = skip.has(line.trim())
+    if (skipping || /^\s+- /.test(line) || /^\|/.test(line)) continue
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
+// The scout's findings as sections of the spec page (and the review): what was observed, what the
+// change touches, defects found along the way, and what was examined. Each returns '' when the
+// spec has no such finding, so older specs render as before.
+function reproductionSection(s) {
+  const r = s.reproduction
+  if (!r) return ''
+  return `## Reproduction\n\n- **Outcome:** ${oneLine(r.outcome)}.\n- **Observed:** ${oneLine(r.observed)}\n- **Cause:** ${oneLine(r.cause)}${r.evidence && r.evidence.length ? `\n- **Evidence:**\n${r.evidence.map(e => `  - ${oneLine(e)}`).join('\n')}` : ''}`
+}
+function impactSection(s) {
+  const i = s.impact
+  if (!i) return ''
+  const code = (i.code || []).map(c => `${c.file}${c.lines ? `, lines ${c.lines.start}–${c.lines.end}` : ''}${c.symbol ? ` (${c.symbol})` : ''}`)
+  return `## What the change touches\n\n- **Code to change:** ${code.length ? code.join('; ') : 'none named'}\n- **Callers and dependents:** ${(i.callers || []).length ? i.callers.map(oneLine).join('; ') : 'none found'}\n- **Tests that cover it:** ${(i.tests_covering || []).length ? i.tests_covering.map(oneLine).join('; ') : 'none found'}\n- **Tests that assert the behaviour being changed:** ${(i.tests_asserting_changed_behaviour || []).length ? i.tests_asserting_changed_behaviour.map(oneLine).join('; ') : 'none'}\n- **Docs and config that describe it:** ${(i.docs_and_config || []).length ? i.docs_and_config.map(oneLine).join('; ') : 'none found'}`
+}
+function followUpsSection(s) {
+  const f = s.follow_ups
+  if (!f || !f.length) return ''
+  return `${FOLLOW_UPS_HEADING}\n\nDefects the scout found off the path to the goal, each at the bar (wrong results, data loss, security, a crash on a reachable path, or a blocker). Nothing here is built or fixed by this change.\n\n${f.map(x => `- ${oneLine(x.text)}${x.evidence ? `\n  - Evidence: ${oneLine(x.evidence)}` : ''}`).join('\n')}`
+}
+// Ways the change could fail that no example exercises (the old RBB's Review focus): short facts a
+// reader should know before looking at the code, each one checkable, none advice.
+const REVIEW_FOCUS_HEADING = '## What no example exercises'
+function reviewFocusSection(s) {
+  const r = s.review_focus
+  if (!r || !r.length) return ''
+  return `${REVIEW_FOCUS_HEADING}\n\nWays the change could fail that none of the examples would catch, as the scout saw them. You should know these before reading the change.\n\n${bullets(r)}`
+}
+function examinedSection(s) {
+  const e = s.examined
+  if (!e) return ''
+  return `${EXAMINED_HEADING}\n\nFiles read:\n\n${bullets(e.read, x => `\`${oneLine(x)}\``)}\n\nCommands run:\n\n${bullets(e.ran, x => `\`${oneLine(x)}\``)}`
+}
+function requestSection(text) {
+  return `${REQUEST_HEADING}\n\n${String(text).split('\n').map(l => `> ${l}`.trimEnd()).join('\n')}`
+}
+
+// Every item id this goal or spec defines.
+function specIds(o) {
+  const lists = [o.done_when, o.constraints, o.out_of_scope, o.agreed_extras, o.decisions, o.plan && o.plan.steps]
+  return new Set(lists.filter(Array.isArray).flat().filter(Boolean).map(i => i.id))
+}
+
+// Text a model wrote that cites one of this goal's or spec's own items by its code. Used only to
+// ask the writer to rephrase (once); text is never rewritten by code, because the same token can
+// legitimately mean something else (an error code, a cell, a version). Only codes this goal or
+// spec defines are looked for. Returns [{ where, code }].
+function codeMentions(o, ids) {
+  const found = []
+  const scan = (where, text) => {
+    for (const m of String(text || '').matchAll(/\b[ECOXDP]\d+\b/g)) if (ids.has(m[0])) found.push({ where, code: m[0] })
+  }
+  for (const k of ['goal', 'title']) scan(k, o[k])
+  for (const k of ['done_when', 'constraints', 'out_of_scope', 'agreed_extras']) for (const i of o[k] || []) { scan(`${k} ${i.id}`, i.text); scan(`${k} ${i.id}`, i.why) }
+  for (const d of o.decisions || []) {
+    for (const f of ['choice', 'because', 'instead_of', 'would_change_if']) scan(`decision ${d.id}`, d[f])
+    for (const a of d.alternatives || []) { scan(`decision ${d.id}`, a.option); scan(`decision ${d.id}`, a.why_not) }
+  }
+  if (o.plan) { scan('plan approach', o.plan.approach); for (const p of o.plan.steps || []) scan(`step ${p.id}`, p.does) }
+  for (const q of o.questions || []) { for (const f of ['question', 'recommendation', 'because', 'affects']) scan('question', q[f]); for (const op of q.options || []) { scan('question', op.option); scan('question', op.means) } }
+  return found
+}
+function mentionProblems(o) {
+  return codeMentions(o, specIds(o)).map(m => `${m.where} cites ${m.code} by its code; refer to it in words, such as "the first example"`)
+}
+
+// One open question on the goal page: the options with what each means, the recommended one with
+// its reason, and what the answer changes elsewhere. A question from before options existed shows
+// its recommendation alone.
+function questionLines(q, n) {
+  const lines = [`${n}. ${oneLine(q.question)}`]
+  if (Array.isArray(q.options) && q.options.length) {
+    for (const o of q.options) lines.push(`   - ${o.option === q.recommendation ? '**Recommended:** ' : ''}${oneLine(o.option)}: ${oneLine(o.means)}`)
+    if (q.because) lines.push(`   - Why the recommendation: ${oneLine(q.because)}`)
+    if (q.affects) lines.push(`   - What the answer changes elsewhere: ${oneLine(q.affects)}`)
+  } else if (q.recommendation) lines.push(`   - Recommended: ${oneLine(q.recommendation)}`)
+  return lines.join('\n')
+}
+
+// The goal as a page for the requester.
+function goalPage(g) {
+  const parts = [
+    `# ${g.title}`,
+    `## Goal\n\n${g.goal}`,
+    `## Done when\n\n${items(g.done_when)}`,
+    `## Constraints\n\n${items(g.constraints)}`,
+    `## Out of scope\n\n${items(g.out_of_scope)}`,
+  ]
+  if (g.agreed_extras && g.agreed_extras.length) parts.push(`## Agreed extras\n\n${items(g.agreed_extras, true)}`)
+  if (g.split_off && g.split_off.length) parts.push(`## Split off\n\nThe request also holds these goals. Each becomes its own change, shaped separately.\n\n${g.split_off.map(x => `- ${x.goal}`).join('\n')}`)
+  if (g.questions && g.questions.length) parts.push(`## Open questions\n\n${g.questions.map((q, n) => questionLines(q, n + 1)).join('\n')}`)
+  parts.push(requestSection(g.source_request))
+  return parts.join('\n\n') + '\n'
+}
+
+// The independent review of alternatives (architecture 5.1.3). Each alternative is named by
+// position: "2.1" is the first alternative of the second decision given.
+function altIds(decisions) {
+  return decisions.flatMap((d, i) => (d.alternatives || []).map((_, j) => `${i + 1}.${j + 1}`))
+}
+
+function ALT_REVIEW_SCHEMA(ids) {
+  return { type: 'object', properties: { verdicts: { type: 'array', minItems: ids.length, maxItems: ids.length, items: { type: 'object', properties: {
+    id: { type: 'string', enum: ids }, keep: { type: 'boolean', description: 'true only for a real alternative' }, why: { type: 'string', description: 'one line' },
+  }, required: ['id', 'keep', 'why'] } } }, required: ['verdicts'] }
+}
+
+// The reviewer sees what the change must achieve, and each choice with its alternatives, but not
+// the decider's reasons for the choice or its conversation.
+function altReviewPrompt(goal, decisions) {
+  const list = decisions.map((d, i) => (d.alternatives || []).length
+    ? `Decision ${i + 1}: ${oneLine(d.choice)}\n${d.alternatives.map((a, j) => `  ${i + 1}.${j + 1}: ${oneLine(a.option)}. ${a.raised_by === 'advocate' ? `Raised by an independent advocate, whose case is: ${oneLine(a.case)}` : `Not taken because: ${oneLine(a.why_not)}`}`).join('\n')}`
+    : '').filter(Boolean).join('\n\n')
+  const must = JSON.stringify({ goal: goal.goal, done_when: goal.done_when, constraints: goal.constraints, out_of_scope: goal.out_of_scope }, null, 2)
+  return `Another agent made the decisions below for a code change and listed, for each, the alternatives it considered and why it did not take them. Judge each alternative on its own: keep it only if it is ${REAL_ALTERNATIVE.replace(/^each /, 'an ').replace(/\. Give why[\s\S]*$/, '.')}
+
+Drop it if it would break the goal, a constraint or an example; if it is only the opposite of the choice and doing nothing is not defensible; or if the reason given against it is a defect (it would be wrong, broken, inaccurate, or fail) rather than a trade-off a reasonable developer could weigh the other way. Do not judge the choice itself, and add no alternative of your own. Answer for every id, once.
+
+What the change must achieve:
+${must}
+
+The decisions and their alternatives:
+${list}`
+}
+
+function altReviewProblems(ids, answer) {
+  const seen = (answer && answer.verdicts || []).map(v => v.id)
+  const missing = ids.filter(id => !seen.includes(id))
+  const twice = seen.filter((id, n) => seen.indexOf(id) !== n)
+  return [...missing.map(id => `no verdict for ${id}`), ...[...new Set(twice)].map(id => `more than one verdict for ${id}`)]
+}
+
+// Keeps the alternatives the reviewer kept; the rest move to dropped_alternatives with the reason,
+// for audit. A decision that has a "sure" flag (the scout's) and loses every alternative is sure.
+// With no answer, the alternatives stay as given and say they were not reviewed.
+function applyAltReview(decisions, answer, run) {
+  const by = new Map(((answer && answer.verdicts) || []).map(v => [v.id, v]))
+  const who = run ? { model: run.model, effort: run.effort, ...(run.alias ? { alias: true } : {}) } : null
+  return decisions.map((d, i) => {
+    const alts = d.alternatives || []
+    if (!alts.length) return d
+    if (!answer) return { ...d, alternatives_reviewed: false }
+    const verdict = (a, j) => by.get(`${i + 1}.${j + 1}`)
+    const kept = alts.filter((a, j) => !verdict(a, j) || verdict(a, j).keep)
+    const dropped = alts.map((a, j) => [a, verdict(a, j)]).filter(([, v]) => v && !v.keep).map(([a, v]) => ({ ...a, dropped_because: v.why }))
+    return { ...d, alternatives: kept, ...(dropped.length ? { dropped_alternatives: dropped } : {}), ...(d.sure !== undefined ? { sure: d.sure || kept.length === 0 } : {}), alternatives_reviewed_by: who }
+  })
+}
+
+// The scout's findings as later steps use them. The scout saves its own answer (scout.json); what
+// code adds is kept apart in scout-meta.json, which holds no reasoning: the base commit, the model
+// and effort that ran the scout, and which alternatives the independent review kept. Nothing the
+// scout wrote is re-typed by another agent (architecture 5.2).
+// advocate: the independent advocate's answer (advocate.json), when there is one: for each decision
+// the best case for deciding otherwise, or none. A case the review kept joins the decision's
+// alternatives, marked as raised by the advocate, and the decision becomes a judgment call.
+function composeFindings(answer, meta, advocate = null) {
+  const run = meta.run || {}
+  const review = meta.review || null
+  const cases = (advocate && Array.isArray(advocate.cases)) ? advocate.cases : []
+  return {
+    v: 1, ...answer, base: meta.base,
+    decisions: answer.decisions.map((d, n) => {
+      const alts = d.alternatives || []
+      const keep = review && review.keep && review.keep[n]
+      const kept = keep ? alts.filter((a, j) => keep[j] !== false) : alts
+      const c = cases.find(x => x && x.decision === n + 1 && isStr(x.option))
+      const raised = c ? [{ option: c.option, why_not: '', case: c.case, evidence: c.evidence, raised_by: 'advocate' }] : []
+      const raisedKept = meta.advocate ? (meta.advocate.keep && meta.advocate.keep[n] ? raised : []) : raised
+      const all = [...kept, ...raisedKept]
+      return {
+        // A call with no real alternative is not a judgment call, whatever the scout said; one that
+        // gains an alternative, from the scout or the advocate, is a judgment call, whatever it said.
+        id: `D${n + 1}`, choice: d.choice, because: d.because, sure: all.length === 0,
+        alternatives: all, would_change_if: d.would_change_if,
+        decided_by: { by: 'model', model: run.model, effort: run.effort, basis: d.basis, ...(run.alias ? { alias: true } : {}) },
+        ...(alts.length || raised.length ? (review ? { alternatives_reviewed_by: review.by } : { alternatives_reviewed: false }) : {}),
+      }
+    }),
+  }
+}
+
+// The advocate (architecture 5.1.3): an agent that sees the goal and the decisions' choices, never
+// the decider's reasons, and argues from the code for the best way of deciding otherwise. It can
+// only add alternatives; a case that meets the bar turns a settled decision into a judgment call.
+const ADVOCATE = { model: 'opus', effort: 'high', alias: true }
+function ADVOCATE_SCHEMA(n) {
+  return { type: 'object', properties: { cases: { type: 'array', minItems: n, maxItems: n, items: { type: 'object', properties: {
+    decision: { type: 'integer', minimum: 1, maximum: n, description: 'the decision number, each once' },
+    option: { type: 'string', description: 'the best other way of deciding, in a few words; empty when no other way meets the goal, every constraint and every example' },
+    case: { type: 'string', description: 'why a competent developer could defensibly decide that way: the trade-off it wins, in terms of the code and the goal; empty when option is empty' },
+    evidence: { type: 'string', description: 'file:line or a command and its output that the case rests on; empty when option is empty' },
+  }, required: ['decision', 'option', 'case', 'evidence'] } } }, required: ['cases'] }
+}
+function advocatePrompt(goal, decisions) {
+  const must = JSON.stringify({ goal: goal.goal, done_when: goal.done_when, constraints: goal.constraints, out_of_scope: goal.out_of_scope }, null, 2)
+  return `Another agent explored this repository and made the decisions below for a change. You see what the change must achieve and what was decided, not why. For each decision, argue from the code for the best way of deciding otherwise: ${REAL_ALTERNATIVE.replace(/^each /, 'an ').replace(/\. Give why[\s\S]*$/, '.')} Read the code the decision concerns before you answer. Give one case per decision, or none when every other way would break the goal, a constraint or an example, or would only be wrong, broken or inaccurate. Do not judge the choice made, and do not repeat it as its own alternative.
+
+Every case you raise is put to the requester as a judgment call, and a change may carry only a few. So raise a case only where deciding otherwise changes what the requester gets: the behaviour, the public interface, what users read in documentation or the changelog, or what is tested and so protected. How the code is arranged, named or placed, which existing test a check goes into, or an equivalent way of writing the same computation is the builder's business: never a case, however defensible. When in doubt, none.
+
+What the change must achieve:
+${must}
+
+The decisions:
+${decisions.map((d, i) => `${i + 1}. ${oneLine(d.choice)}`).join('\n')}`
+}
+function advocateProblems(n, answer) {
+  const seen = ((answer && answer.cases) || []).map(c => c && c.decision)
+  const errs = []
+  for (let i = 1; i <= n; i++) if (!seen.includes(i)) errs.push(`no case or none for decision ${i}`)
+  for (const c of (answer && answer.cases) || []) if (c && isStr(c.option) && !isStr(c.case)) errs.push(`decision ${c.decision}: an option needs its case`)
+  return errs
+}
+
+// Two JSON values equal whatever their key order or formatting.
+function sameJson(a, b) {
+  const canon = v => (Array.isArray(v) ? v.map(canon) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map(k => [k, canon(v[k])])) : v)
+  return JSON.stringify(canon(a)) === JSON.stringify(canon(b))
+}
+
+// The full spec, assembled in memory: the goal, the findings and the plan, as their authors saved them.
+function buildSpec(change, goal, findings, plan) {
+  const spec = {
+    v: 1, change, base: findings.base, title: goal.title, goal: goal.goal,
+    done_when: goal.done_when, constraints: goal.constraints, out_of_scope: goal.out_of_scope,
+    decisions: findings.decisions.map(d => ({ ...d, judgment: !d.sure })),
+    plan: {
+      approach: plan.approach,
+      steps: plan.steps.map((s, n) => ({ id: `P${n + 1}`, does: s.does, serves: s.serves, locations: s.locations.map(i => {
+        const l = findings.locations[i]
+        return { file: l.file, lines: l.lines, symbol: l.symbol, change: l.change }
+      }) })),
+    },
+    source_request: goal.source_request,
+    amendments: [],
+  }
+  if (goal.agreed_extras) spec.agreed_extras = goal.agreed_extras
+  // What the scout found, for the person approving and the reviewer: the reproduction, the impact,
+  // the project's conventions, defects found along the way, and what was examined (the old RBB's
+  // Reproduction, What will be touched, Follow-ups and Examined). Older findings lack them.
+  if (findings.reproduction) spec.reproduction = findings.reproduction
+  if (findings.impact) {
+    const { read, ran, ...impact } = findings.impact
+    spec.impact = impact
+    spec.examined = { read: read || [], ran: ran || [] }
+  }
+  if (findings.conventions) spec.conventions = findings.conventions
+  if (findings.follow_ups) spec.follow_ups = findings.follow_ups
+  if (findings.review_focus) spec.review_focus = findings.review_focus
+  return spec
+}
+
+// The spec is spread over files, each saved once by its author (architecture 5.2.1): the goal, the
+// scout's findings and what code added to them, and the planner's plan. spec.json is only a manifest
+// naming them; every reader rebuilds the full spec in memory, so nothing an agent wrote is re-typed.
+const SPEC_PARTS = ['goal.json', 'scout.json', 'scout-meta.json', 'plan.json', 'advocate.json']
+const SPEC_FILES = ['spec.json', ...SPEC_PARTS]
+const specManifest = (change, base, title) => ({ v: 2, change, base, title, parts: SPEC_PARTS })
+
+// texts: each spec file's content by name ('' when missing). A spec.json from before the manifest
+// holds the whole spec and needs no other file; a manifest names the files it has (advocate.json
+// came later), so a missing file is one the manifest names.
+function specFromTexts(change, texts) {
+  const parse = t => { try { return t && String(t).trim() ? JSON.parse(t) : null } catch (e) { return null } }
+  const top = parse(texts['spec.json'])
+  if (!top) return { error: 'spec.json is missing or not JSON' }
+  if (!top.parts) return { spec: top }
+  const missing = specFiles(top).slice(1).filter(f => !parse(texts[f]))
+  if (missing.length) return { error: `these files of the spec are missing or not JSON: ${missing.join(', ')}` }
+  let spec
+  try {
+    spec = buildSpec(change, parse(texts['goal.json']), composeFindings(parse(texts['scout.json']), parse(texts['scout-meta.json']), parse(texts['advocate.json'])), parse(texts['plan.json']))
+  } catch (e) { return { error: `the files of the spec do not fit together: ${e.message}` } }
+  if (spec.base !== top.base) return { error: 'spec.json names a different base commit from the findings' }
+  return { spec }
+}
+
+// git hash-object, run on hashedFiles(approval) in order, prints one blob id per file: the spec
+// files whose id differs from the approved one.
+function changedSpecFiles(approval, hashOutput) {
+  const ids = String(hashOutput || '').trim().split(/\s+/)
+  return hashedFiles(approval).filter((f, n) => ids[n] !== approval.hashes[f])
+}
+// The spec's files as its manifest names them: spec.json and its parts (a manifest from before a
+// part existed does not name it).
+const specFiles = manifest => ['spec.json', ...(manifest && Array.isArray(manifest.parts) ? manifest.parts : SPEC_PARTS)]
+
+// A decision's alternatives. Records written before the list existed hold one free-text instead_of.
+const alternativesOf = d => (Array.isArray(d.alternatives) ? d.alternatives : d.instead_of ? [{ option: d.instead_of, why_not: '' }] : [])
+
+const SETTLED_BY = { "requester's answer": "the requester's answer", goal: 'the goal', constraint: 'a constraint', 'project convention': 'project convention', 'smallest change': 'the smallest change' }
+
+// A decision's details, the same on every page: why, the alternatives with why each was dropped,
+// what could change it, and who decided, by what, and when.
+function decisionLines(d, when) {
+  const stop = t => { const s = oneLine(t).trim(); return !s ? '' : /[.!?]$/.test(s) ? s : `${s}.` }
+  const lower = t => t.replace(/^[A-Z](?![A-Z])/, c => c.toLowerCase())
+  const alts = alternativesOf(d)
+  // Who made the decision and when ("Decision by"), then what settled it ("Decided by").
+  const w = d.decided_by
+  const actor = !w ? '' : w.by === 'requester' ? 'the requester' : `${w.model || 'a model'}${w.effort ? ` at ${w.effort} effort` : ''}${w.alias ? ' (model alias)' : ''}`
+  const moment = when ? oneLine(when).replace(/^Made\s+/i, '').replace(/\.$/, '') : ''
+  return [
+    `- **Why:** ${stop(d.because)}`,
+    alts.length ? `- **Alternatives considered:**\n${alts.map(a => `  - ${a.raised_by === 'advocate' ? `${oneLine(a.option).replace(/\.$/, '')}: raised by an independent advocate, not weighed by the decider. Its case: ${stop(a.case)}${a.evidence ? ` Evidence: ${stop(a.evidence)}` : ''}` : a.why_not ? `${oneLine(a.option).replace(/\.$/, '')}: not taken because ${lower(stop(a.why_not))}` : stop(a.option)}`).join('\n')}` : '',
+    d.would_change_if ? `- **What could change this:** ${stop(d.would_change_if)}` : '',
+    actor || moment ? `- **Decision by:** ${stop([actor, moment].filter(Boolean).join(', '))}` : '',
+    w && w.basis ? `- **Decided by:** ${stop(SETTLED_BY[w.basis] || w.basis)}` : '',
+  ].filter(Boolean)
+}
+
+// A page saved without its reasoning (architecture 5.2.1), when the agent saving the full page was
+// refused for copying it: the record files hold the reasoning in full, and the page says so.
+const reasonsLeftOut = files => `*The reasons behind each decision, the alternatives considered and what could change it are left off this page: the agent saving it was not allowed to copy another agent's reasoning. They are in full in ${files.map(f => `\`${f}\``).join(', ')}.*`
+
+// The spec as a page for the requester and the reviewer: what and why first, then how.
+// With { reasons: false }, the decisions are one line each and the page says where the reasons are.
+function specPage(s, opts = {}) {
+  const where = l => `${l.file}${l.lines ? `, lines ${l.lines.start}–${l.lines.end}` : ''}${l.symbol ? ` (${l.symbol})` : ''}: ${l.change}`
+  const who = d => {
+    const w = d.decided_by
+    if (!w) return ''
+    // The same words as the full entry: who made the decision, then what decided it.
+    return `decision by ${w.by === 'requester' ? 'the requester' : `${w.model || 'a model'}${w.effort ? ` at ${w.effort} effort` : ''}`}${w.basis ? `, decided by ${SETTLED_BY[w.basis] || w.basis}` : ''}`
+  }
+  const decision = d => [
+    `### Decision ${num(d.id)}: ${oneLine(d.choice)}`,
+    ...decisionLines(d, 'Made while planning.'),
+    d.related && d.related.length ? `- **Related:** ${refs(d.related)}` : '',
+  ].filter(Boolean).join('\n')
+  const parts = [
+    `# ${s.title || s.change}`,
+    `## Goal\n\n${s.goal}`,
+    `## Done when\n\n${items(s.done_when)}`,
+    `## Constraints\n\n${items(s.constraints)}`,
+    `## Out of scope\n\n${items(s.out_of_scope)}`,
+  ]
+  if (s.agreed_extras && s.agreed_extras.length) parts.push(`## Agreed extras\n\n${items(s.agreed_extras, true)}`)
+  parts.push(reproductionSection(s), impactSection(s))
+  // Judgment calls first, in full: that is where the reader's attention belongs. A sure decision,
+  // with no credible alternative, takes one line (the old RBB's rule).
+  const calls = s.decisions.filter(d => d.judgment !== false)
+  const sure = s.decisions.filter(d => d.judgment === false)
+  const brief = d => `- **Decision ${num(d.id)}:** ${oneLine(d.choice)}${who(d) ? ` (${who(d)})` : ''}`
+  const decisions = [
+    calls.length ? (opts.reasons === false ? `### Judgment calls\n\n${calls.map(brief).join('\n')}` : calls.map(decision).join('\n\n')) : '',
+    sure.length ? `### Settled, with no credible alternative\n\n${sure.map(brief).join('\n')}` : '',
+    opts.reasons === false && s.decisions.length ? reasonsLeftOut(['scout.json', 'plan.json']) : '',
+  ].filter(Boolean).join('\n\n')
+  parts.push(`## Decisions\n\n${decisions || 'None.'}`)
+  parts.push(`## Plan\n\n${s.plan.approach || ''}\n\n${table(['Step', 'What it does', 'Serves', 'Where'], s.plan.steps.map(p => [num(p.id), p.does, refs(p.serves), p.locations.map(where).join('; ')]))}`)
+  if (s.amendments && s.amendments.length) parts.push(`## Amendments\n\n${s.amendments.map((a, n) => `${n + 1}. ${typeof a === 'string' ? a : JSON.stringify(a)}`).join('\n')}`)
+  parts.push(reviewFocusSection(s), followUpsSection(s), examinedSection(s), requestSection(s.source_request))
+  return parts.filter(Boolean).join('\n\n') + '\n'
+}
+
+// git log --format='%H %(trailers:key=RBB-Approved,valueonly,separator=%x2C)' -- <spec>
+// Newest first. Each line: <sha> [<trailer values, comma-separated>]
+function parseLog(text, change) {
+  const commits = text.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+    const sp = l.indexOf(' ')
+    const sha = sp < 0 ? l : l.slice(0, sp)
+    const values = sp < 0 ? [] : l.slice(sp + 1).split(',').map(v => v.trim()).filter(Boolean)
+    return { sha, approves: values.includes(change), values }
+  })
+  const approvals = commits.filter(c => c.approves).map(c => c.sha)
+  const unapproved = commits.filter(c => !c.approves).map(c => ({ sha: c.sha, trailer: c.values.join(',') || null }))
+  return { approvals, latest: approvals[0] || null, unapproved }
+}
+
+// A commit subject RBB makes: the prefix, then the title, within git's usual 72 characters,
+// cut at a word boundary. It goes into a shell command inside double quotes, so characters that
+// would need quoting care in bash or PowerShell are removed.
+const SUBJECT_LIMIT = 72
+function commitSubject(prefix, title) {
+  const clean = t => String(t).replace(/["'`$\\]/g, '').replace(/\s+/g, ' ')
+  // The prefix keeps its trailing space ("Approve spec: "); only the title is trimmed.
+  const p = clean(prefix).replace(/^\s+/, ''), t = clean(title).trim()
+  const room = SUBJECT_LIMIT - p.length
+  if (t.length <= room) return p + t
+  const cut = t.slice(0, room + 1).replace(/\s+\S*$/, '')
+  return p + (cut || t.slice(0, room))
+}
+// </lib:spec>
+
+// <lib:build> copied from src/lib/build.js by tools/sync-lib.mjs; edit the source, not this copy
+// The builder's log (architecture 5.3): its schema, validation and page. Pure functions only.
+// Needs the spec library (copied before this one): ID, KIND, num, refs, oneLine.
+
+const BUILD_KINDS = ['evidence', 'decision', 'deviation', 'claim']
+
+// The log as the builder answers it, through a schema built from the approved spec: it can cite
+// only examples, steps and items that exist.
+function BUILD_SCHEMA(spec) {
+  const eIds = spec.done_when.map(i => i.id)
+  const pIds = spec.plan.steps.map(p => p.id)
+  const itemIds = [...eIds, ...spec.constraints.map(i => i.id), ...spec.out_of_scope.map(i => i.id), ...(spec.agreed_extras || []).map(i => i.id), ...spec.decisions.map(d => d.id)]
+  const s = d => ({ type: 'string', description: d })
+  return { type: 'object', properties: {
+    evidence: { type: 'array', items: { type: 'object', properties: { item: { type: 'string', enum: eIds }, before: s('what the example gave before the change'), after: s('what it gives after'), how: s('the command or check that showed it') }, required: ['item', 'before', 'after', 'how'] } },
+    decisions: { type: 'array', items: { type: 'object', properties: { serves: { type: 'array', items: { type: 'string', enum: itemIds } }, choice: s(''), because: s(''), alternatives: { type: 'array', description: REAL_ALTERNATIVE, items: { type: 'object', properties: { option: s(''), why_not: s('') }, required: ['option', 'why_not'] } }, would_change_if: s('what would make another choice right; empty if nothing would'), basis: { type: 'string', enum: BASES, description: 'the criterion that settled it' } }, required: ['serves', 'choice', 'because', 'alternatives', 'would_change_if', 'basis'] } },
+    deviations: { type: 'array', items: { type: 'object', properties: { step: { type: 'string', enum: pIds }, planned: s('what the plan said'), actual: s('what was done instead'), because: s('') }, required: ['step', 'planned', 'actual', 'because'] } },
+    claims: { type: 'array', items: s('one thing the change does, checkable against the diff') },
+  }, required: ['evidence', 'decisions', 'deviations', 'claims'] }
+}
+
+// The saved log: the builder's answer with ids and who decided stamped by code. The model and
+// effort are the ones the workflow started the builder with, never the builder's own claim.
+function toBuildLog(answer, run) {
+  let n = 0
+  const id = () => `B${++n}`
+  // The model and effort are stamped by code; the basis is the builder's own answer, from a fixed list.
+  const by = { by: 'model', model: run.model, effort: run.effort, ...(run.alias ? { alias: true } : {}) }
+  return { v: 1, entries: [
+    ...answer.evidence.map(e => ({ kind: 'evidence', ...e })),
+    ...answer.decisions.map(({ basis, ...d }) => ({ kind: 'decision', id: id(), ...d, decided_by: { ...by, basis } })),
+    ...answer.deviations.map(d => ({ kind: 'deviation', id: id(), ...d, decided_by: by })),
+    ...answer.claims.map(t => ({ kind: 'claim', text: t })),
+  ] }
+}
+
+// The builder saves its own answer (build.json); what code adds is kept apart in build-meta.json:
+// the model and effort that ran it, and which alternatives the independent review kept (architecture
+// 5.2.1). Readers rebuild the log in memory.
+function composeBuildLog(answer, meta) {
+  const log = toBuildLog(answer, (meta && meta.run) || {})
+  const review = (meta && meta.review) || null
+  let i = -1
+  log.entries = log.entries.map(e => {
+    if (e.kind !== 'decision') return e
+    i++
+    const alts = e.alternatives || []
+    if (!alts.length) return e
+    if (!review) return { ...e, alternatives_reviewed: false }
+    const keep = review.keep[i] || []
+    return { ...e, alternatives: alts.filter((a, j) => keep[j] !== false), alternatives_reviewed_by: review.by }
+  })
+  return log
+}
+
+// The log as text, from build.json and build-meta.json; empty when there is none. A build.json from
+// before the split is a log already.
+function buildLogText(buildText, metaText) {
+  const parse = t => { try { return t && String(t).trim() ? JSON.parse(t) : null } catch (e) { return null } }
+  const b = parse(buildText)
+  if (!b) return String(buildText || '').trim() ? String(buildText) : ''
+  if (Array.isArray(b.entries)) return JSON.stringify(b)
+  return JSON.stringify(composeBuildLog(b, parse(metaText)))
+}
+
+// The log as committed. Empty text means no log. With the spec, references are checked too:
+// evidence names a real example, a deviation a real step, a decision real items.
+// Claims get ids K1, K2, ... in log order so the claims judge answers by id.
+function parseBuild(text, spec) {
+  const empty = { entries: [], claims: [], deviations: [], decisions: [], evidence: [], errors: [] }
+  if (!text.trim()) return empty
+  let b
+  try { b = JSON.parse(text) } catch (e) { return { ...empty, errors: [`build.json is not valid JSON: ${e.message}`] } }
+  const errors = []
+  if (!b || b.v !== 1 || !Array.isArray(b.entries)) return { ...empty, errors: ['build.json: expected {"v": 1, "entries": [...]}'] }
+  const eIds = spec ? new Set(spec.done_when.map(i => i.id)) : null
+  const pIds = spec ? new Set(spec.plan.steps.map(p => p.id)) : null
+  const items = spec ? new Set([...spec.done_when, ...spec.constraints, ...spec.out_of_scope, ...(spec.agreed_extras || []), ...spec.decisions].map(i => i.id)) : null
+  b.entries.forEach((e, n) => {
+    const at = `build.json entries[${n}]`
+    if (!e || !BUILD_KINDS.includes(e.kind)) errors.push(`${at}: kind must be one of ${BUILD_KINDS.join(', ')}`)
+    else if ((e.kind === 'decision' || e.kind === 'deviation') && !/^B\d+$/.test(e.id || '')) errors.push(`${at}: a ${e.kind} needs an id B1, B2, ...`)
+    else if (e.kind === 'claim' && !(typeof e.text === 'string' && e.text.trim())) errors.push(`${at}: a claim needs text`)
+    else if (spec && e.kind === 'evidence' && !eIds.has(e.item)) errors.push(`${at}: evidence for ${e.item}, which is not an example of the spec`)
+    else if (spec && e.kind === 'deviation' && !pIds.has(e.step)) errors.push(`${at}: a deviation from ${e.step}, which is not a step of the plan`)
+    else if (spec && e.kind === 'decision' && Array.isArray(e.serves) && e.serves.some(x => !items.has(x))) errors.push(`${at}: a decision serving an item the spec does not have`)
+  })
+  const bIds = b.entries.filter(e => e && e.id).map(e => e.id)
+  const dup = bIds.filter((x, n) => bIds.indexOf(x) !== n)
+  if (dup.length) errors.push(`build.json: duplicate ids ${[...new Set(dup)].join(', ')}`)
+  const ok = b.entries.filter(e => e && BUILD_KINDS.includes(e.kind))
+  return {
+    entries: ok,
+    claims: ok.filter(e => e.kind === 'claim').map((e, n) => ({ id: `K${n + 1}`, text: e.text })),
+    deviations: ok.filter(e => e.kind === 'deviation'),
+    decisions: ok.filter(e => e.kind === 'decision'),
+    evidence: ok.filter(e => e.kind === 'evidence'),
+    errors,
+  }
+}
+
+// The log as a page for people: examples, steps and decisions named in words, never by code.
+function buildPage(log, spec) {
+  const b = parseBuild(JSON.stringify(log), spec)
+  const parts = ['# Build log']
+  parts.push(`## Evidence for each example\n\n${b.evidence.length ? b.evidence.map(e => `- **Example ${num(e.item)}.** Before: ${oneLine(e.before)}. After: ${oneLine(e.after)}. Shown by: ${oneLine(e.how)}`).join('\n') : 'None recorded.'}`)
+  parts.push(`## Decisions made while building\n\n${b.decisions.length ? b.decisions.map((d, n) => [`### Build decision ${n + 1}: ${oneLine(d.choice)}`, d.serves && d.serves.length ? `- **Serves:** ${refs(d.serves)}` : '', ...decisionLines(d, 'Made while building.')].filter(Boolean).join('\n')).join('\n\n') : 'None.'}`)
+  parts.push(`## Deviations from the plan\n\n${b.deviations.length ? b.deviations.map(d => `- **Step ${num(d.step)}.** Planned: ${oneLine(d.planned)}. Done instead: ${oneLine(d.actual)}. Because: ${oneLine(d.because)}`).join('\n') : 'None.'}`)
+  parts.push(`## What the builder says the change does\n\nThese are the builder's own claims; the check verifies each against the change.\n\n${b.claims.length ? b.claims.map(c => `- ${oneLine(c.text)}`).join('\n') : 'None.'}`)
+  return parts.join('\n\n') + '\n'
+}
+// </lib:build>
+
+// <lib:pr> copied from src/lib/pr.js by tools/sync-lib.mjs; edit the source, not this copy
+// The pull request (architecture 8.1): a short body from the spec, the check and the build log,
+// filled into the project's template when it has one. It never repeats the review: it links to it.
+// Pure functions only. Needs the spec library (oneLine, commitSubject).
+
+// GitHub's own places for a single template, in the order GitHub looks.
+const PR_TEMPLATE_PLACES = ['.github/pull_request_template.md', 'pull_request_template.md', 'docs/pull_request_template.md']
+
+// The template among the repository's tracked files. Several templates in a PULL_REQUEST_TEMPLATE
+// folder are a choice for the author, so none is picked.
+function findTemplate(files) {
+  const lower = new Map(files.map(f => [f.trim().toLowerCase(), f.trim()]))
+  for (const p of PR_TEMPLATE_PLACES) if (lower.has(p)) return { path: lower.get(p), note: null }
+  const many = files.map(f => f.trim()).filter(f => /^(\.github\/|docs\/)?pull_request_template\/[^/]+\.md$/i.test(f))
+  if (many.length === 1) return { path: many[0], note: null }
+  return { path: null, note: many.length ? `the project has ${many.length} pull request templates; none was chosen, so RBB's own sections are used` : null }
+}
+
+// "owner/repo" from a GitHub remote URL, or null for any other remote.
+function githubRepo(url) {
+  const m = /github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/.exec(String(url || '').trim())
+  return m ? `${m[1]}/${m[2]}` : null
+}
+
+// The review at the commit that holds it: still resolves after the records are cleared.
+function reviewLink(repo, sha, change) {
+  const path = `.rbb/${change}/review.md`
+  return repo ? `https://github.com/${repo}/blob/${sha}/${path}` : path
+}
+
+// What a PR reviewer needs before opening the review: the goal; each change, with where it is;
+// the check's result with each difference and each statement to confirm as one line; and the
+// judgment calls, one line each. Headlines only: the reasons and the detail stay in the review.
+function prParts(spec, check, link) {
+  const hunks = new Map((check.hunks || []).map(h => [h.id, h]))
+  const units = check.units || []
+  const line = t => oneLine(t || '').trim().replace(/\.$/, '')
+  // Where a change is, as lines of the changed code, grouped by file.
+  const where = ids => {
+    const byFile = new Map()
+    for (const id of ids) {
+      const h = hunks.get(id)
+      if (!h) continue
+      const at = h.new_start === undefined || h.new_start === null ? '' : h.new_len === 0 ? `removed after line ${h.new_start}` : h.new_len === 1 ? `line ${h.new_start}` : `lines ${h.new_start}–${h.new_start + h.new_len - 1}`
+      if (!byFile.has(h.file)) byFile.set(h.file, [])
+      if (at) byFile.get(h.file).push(at)
+    }
+    return [...byFile].map(([f, a]) => `\`${f}\`${a.length ? ` ${a.join(', ')}` : ''}`).join('; ')
+  }
+  const changes = units.map(u => `- ${line(u.summary || 'A change')}.${u.hunks.length ? `\n  - Where: ${where(u.hunks)}` : ''}`)
+
+  // Each difference from the approved spec, as one line: what it is, and where.
+  const item = id => { const i = [...spec.done_when, ...spec.constraints, ...spec.out_of_scope].find(x => x.id === id); return i ? `"${line(i.text)}"` : 'an item of the spec' }
+  const step = id => { const p = spec.plan.steps.find(x => x.id === id); return p ? `"${line(p.does)}"` : 'a plan step' }
+  const label = e => ({
+    unrequested: e.extras && e.extras.length ? `Not asked for: ${line(typeof e.extras[0] === 'string' ? e.extras[0] : e.extras[0].text)}` : 'A change nobody asked for',
+    unexplained_deviation: 'Changed outside the plan, with no reason logged',
+    item_missing: `Example not met: ${item(e.item)}`, item_partial: `Example only partly met: ${item(e.item)}`,
+    item_contradicts: `Example contradicted: ${item(e.item)}`, item_needs_a_person: `Example the change alone cannot show: ${item(e.item)}`,
+    constraint_violated: `Constraint broken: ${item(e.item)}`, step_not_done: `Plan step not done: ${step(e.step)}`,
+    unsupported_claim: `The builder's claim is contradicted: "${line(e.claim)}"`,
+    decision_conflict: 'A build decision goes against the approved spec', spec_integrity: 'The approved spec was changed without approval',
+  }[e.kind] || e.kind)
+  const explained = ((check.plan && check.plan.unplanned_hunks) || []).filter(u => u.explained_by)
+  const differences = [
+    ...(check.exceptions || []).map(e => `- ${label(e)}${e.hunks && e.hunks.length ? ` (${where(e.hunks)})` : ''}.`),
+    ...explained.map(u => `- Changed outside the plan, with the builder's reason (${where([u.hunk])}).`),
+  ]
+  const confirm = (check.for_a_person || []).map(c => `- "${line(c.claim)}"`)
+  // Mode none has no review file to link to: the review is collapsed at the end of the body.
+  const review = link ? `[the review](${link})` : 'the review at the end'
+  const result = check.verdict === 'error'
+    ? `RBB's check of this change did not complete. See ${review}.`
+    : [
+        `RBB checked the change against its approved spec: ${differences.length ? `${differences.length} difference${differences.length === 1 ? '' : 's'}` : 'no differences'}. Each one, with its reason and the code, is in ${review}.`,
+        differences.join('\n'),
+        confirm.length ? `The builder also says the following, which the change alone cannot show; a person should confirm it:\n\n${confirm.join('\n')}` : '',
+      ].filter(Boolean).join('\n\n')
+  const calls = spec.decisions.filter(d => d.judgment !== false).map(d => `- ${line(d.choice)}.`)
+  // Defects the scout found off the path, left alone by this change: one line each, for the reviewer.
+  const followUps = (spec.follow_ups || []).map(f => `- ${line(f.text)}.`)
+  // What no example exercises: what the reviewer should know before reading, one line each.
+  const focus = (spec.review_focus || []).map(f => `- ${line(f)}.`)
+  return { goal: oneLine(spec.goal), changes: changes.join('\n') || '- No code changed.', check: result, decisions: calls.join('\n'), follow_ups: followUps.join('\n'), review_focus: focus.join('\n') }
+}
+
+function prBody(parts) {
+  return [
+    `## Goal\n\n${parts.goal}`,
+    `## What changed\n\n${parts.changes}`,
+    `## Check\n\n${parts.check}`,
+    parts.review_focus ? `## What no example exercises\n\nYou should know these before reading the change.\n\n${parts.review_focus}` : '',
+    parts.decisions ? `## Decisions worth a look\n\nJudgment calls made while planning; why each was made, and the alternatives, are in the review.\n\n${parts.decisions}` : '',
+    parts.follow_ups ? `## Found along the way, not part of this change\n\n${parts.follow_ups}` : '',
+  ].filter(Boolean).join('\n\n') + '\n'
+}
+
+// Who drafted it, for a template that asks: the tool, and the models that made the decisions, with
+// their effort, from the stamps in the spec and the build log (section 5.1.2).
+function prFacts(spec, log) {
+  const roles = new Map()
+  const add = (w, role) => {
+    if (!w || w.by !== 'model' || !w.model) return
+    const key = `${w.model}${w.effort ? ` at ${w.effort} effort` : ''}`
+    if (!roles.has(key)) roles.set(key, [])
+    if (!roles.get(key).includes(role)) roles.get(key).push(role)
+  }
+  for (const d of spec.decisions || []) { add(d.decided_by, 'planning'); if (d.alternatives_reviewed_by) add({ by: 'model', ...d.alternatives_reviewed_by }, 'reviewing alternatives') }
+  for (const e of (log && log.entries) || []) if (e.kind === 'decision' || e.kind === 'deviation') { add(e.decided_by, 'building'); if (e.alternatives_reviewed_by) add({ by: 'model', ...e.alternatives_reviewed_by }, 'reviewing alternatives') }
+  const models = [...roles].map(([m, r]) => `${m} (${r.join(', ')})`).join('; ')
+  return { tool: 'RBB (Record Before Build), a Claude Code plugin', models: models || 'not recorded', notes: 'Built from a spec the requester approved; the review linked above checks the change against it.' }
+}
+
+const SUMMARY_HEADING = /summary|description|what|changes?\b|overview|motivation|context|why|purpose/i
+const AGENT_HEADING = /\bagents?\b|\bai\b|\bllm\b|\bmodels?\b|assist|automat|generat|drafting/i
+
+// The template, its parts kept: preamble, headings, comments and checklists. The summary goes into
+// the first summary section, or a new one at the end; an AI-assistance section has its empty
+// "Label:" lines filled from the record. Checkboxes are never ticked.
+function fillTemplate(text, parts, facts) {
+  const lines = String(text).replace(/\r\n/g, '\n').split('\n')
+  const sections = [{ heading: null, lines: [] }]
+  for (const l of lines) {
+    if (/^#{1,6}\s/.test(l)) sections.push({ heading: l, lines: [] })
+    else sections[sections.length - 1].lines.push(l)
+  }
+  const summary = [parts.goal, `**What changed**\n\n${parts.changes}`, `**Check**\n\n${parts.check}`, parts.decisions ? `**Decisions worth a look** (why, and the alternatives, are in the review)\n\n${parts.decisions}` : ''].filter(Boolean).join('\n\n')
+  const isSummary = s => s.heading && SUMMARY_HEADING.test(s.heading) && !AGENT_HEADING.test(s.heading)
+  const target = sections.find(isSummary)
+  const fill = l => {
+    const m = /^(\s*(?:[-*]\s+)?)([A-Za-z][A-Za-z /()-]*?):\s*$/.exec(l)
+    if (!m) return l
+    const label = m[2].toLowerCase()
+    const value = /model/.test(label) ? facts.models : /agent|tool|assistant/.test(label) ? facts.tool : /note/.test(label) ? facts.notes : null
+    return value ? `${m[1]}${m[2]}: ${value}` : l
+  }
+  const out = sections.map(s => {
+    let body = s.lines
+    if (s.heading && AGENT_HEADING.test(s.heading)) body = body.map(fill)
+    if (s === target) {
+      const kept = body.join('\n').trim()
+      return [s.heading, '', ...(kept ? [kept, ''] : []), summary, ''].join('\n')
+    }
+    return [...(s.heading ? [s.heading] : []), ...body].join('\n')
+  })
+  let result = out.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+  if (!target) result += `\n\n## Summary\n\n${summary}`
+  return result + '\n'
+}
+
+// Mode none (architecture 9.1): the review itself, collapsed, and the approved spec's hash, which is
+// the only evidence in the repository that the spec was not changed after approval. With no review
+// text (the agent saving the body was refused for copying it), the body says where the review is.
+function noneAppendix(reviewText, hashes, reviewPath) {
+  const ids = Object.entries(hashes).map(([f, h]) => `- \`${f}\`: \`${h}\``).join('\n')
+  const review = reviewText
+    ? `<details>\n<summary>The full review</summary>\n\n${String(reviewText).trim()}\n\n</details>`
+    : `The full review is not in this body: the agent saving the body was not allowed to copy it. The requester holds it on their machine as \`${reviewPath || 'review.md'}\`.`
+  return `\n${review}\n\nThe approved spec's files, by git blob id:\n\n${ids}\n\nThis repository keeps no RBB files, so these ids, kept by the requester, are the only evidence that the spec was not changed after approval.\n`
+}
+
+// The PR title: the spec's title, safe to pass as a quoted argument.
+function prTitle(spec) {
+  return String(spec.title || spec.change).replace(/["'`$\\]/g, '').replace(/\s+/g, ' ').trim()
+}
+
+// The commit that holds the check and the review, in the project's commit style.
+function recordsSubject(spec, style) {
+  const prefix = style && style.kind === 'conventional' ? `${style.type || 'docs'}${style.scope ? `(${style.scope})` : ''}: record the check of ` : 'Record the check: '
+  return commitSubject(prefix, spec.title || spec.change)
+}
+
+function recordsCommands(change, subject) {
+  const files = `.rbb/${change}/check.json .rbb/${change}/review.md`
+  return [`git add -- ${files}`, `git commit -m "${subject}" -- ${files}`]
+}
+// </lib:pr>
+
+const READBACK_SCHEMA_PR = { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] }
+// refused separates a command that was never allowed to run from one that printed nothing.
+const RELAY_PR = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, { type: 'string', description: `stdout of the command labelled ${k}, verbatim` }])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run; empty if all ran' } }, required: [...keys, 'refused'] })
+const DEFAULT_BRANCH = /^(main|master|develop|trunk)$/
+
+// </pure>
+
+// <lib:record> copied from src/lib/record.js by tools/sync-lib.mjs; edit the source, not this copy
+// Save a file from inside a workflow and verify it by reading it back (architecture 5.2).
+// Workflow scripts cannot write files, so the recorder agent (Read and Write) writes, a checker agent
+// reads it back through a schema, and code compares. Uses the workflow globals agent and log.
+
+const READBACK_SCHEMA = { type: 'object', properties: { content: { type: 'string', description: 'the file content, verbatim' } }, required: ['content'] }
+
+// Text compared line by line, ignoring only trailing spaces and trailing blank lines.
+function sameText(a, b) {
+  const norm = t => String(t).split('\n').map(l => l.replace(/\s+$/, '')).join('\n').replace(/\n+$/, '')
+  return norm(a) === norm(b)
+}
+
+// true when saved and verified; null when the agent saving it ended with an error, which is not
+// retried: when the error is a safeguard refusal, Anthropic's documentation says to change the
+// request rather than retry it, and refusals are billed; false when the read-back never matched.
+async function recordFile(path, text, phase, same = sameText) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const wrote = await agent(`Write this content to ${path}:\n\n${text}`, { label: `write ${path} (${attempt})`, phase, agentType: 'rbb:recorder', effort: 'low' })
+    if (wrote === null) { log(`${path}: the agent saving it ended with an error (a safeguard refusal, or an API error); not retried`); return null }
+    const back = await agent(`Read the file ${path} and return its content verbatim, without line numbers.`, { label: `read back ${path} (${attempt})`, phase, agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })
+    if (back && same(back.content, text)) return true
+    log(`${path}: read-back did not match (attempt ${attempt})`)
+  }
+  return false
+}
+
+// A page for people combines several agents' reasoning, and the agent saving it may be refused for
+// copying it (architecture 5.2.1). Then the page without that reasoning is saved instead, when the
+// caller gives one: 'full', 'reduced', or false when neither was saved.
+async function recordPage(path, full, reduced, phase) {
+  const first = await recordFile(path, full, phase)
+  if (first) return 'full'
+  if (first !== null || !reduced) return false
+  log(`${path}: saving the page without the reasoning it carries`)
+  return (await recordFile(path, reduced, phase)) ? 'reduced' : false
+}
+// </lib:record>
+
+// The skill passes {"change": ...}; an agent that passes the argument text itself means its first word.
+const change = typeof args === 'string' ? args.trim().split(/\s+/)[0] : args && args.change
+if (!change || !/^[a-z0-9][a-z0-9-]*$/.test(change)) return { error: 'rbb:pr needs a change name' }
+const dir = `.rbb/${change}`
+
+async function relay(label, cmds) {
+  const keys = cmds.map(([k]) => k)
+  const prompt = `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label. If a command prints nothing, or fails, return an empty string for it. If you were not allowed to run a command, return an empty string and list its label under refused.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
+  // Nothing to run: nothing to relay, and no schema with an empty enum, which the host rejects.
+  if (!cmds.length) return { out: {} }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const [a, b] = await parallel([1, 2].map(i => () => agent(prompt, { label: `${label} ${attempt}.${i}`, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: RELAY_PR(keys) })))
+    const refused = [...new Set([...((a && a.refused) || []), ...((b && b.refused) || [])])]
+    if (refused.length) return { refused: refused.map(k => cmds.find(([l]) => l === k)[1]) }
+    if (a && b && keys.every(k => String(a[k]).trim() === String(b[k]).trim())) return { out: Object.fromEntries(keys.map(k => [k, String(a[k]).replace(/\s+$/, '')])) }
+  }
+  return null
+}
+const refusedError = r => ({ change, error: `these read-only commands were not allowed to run; allow them and try again: ${r.refused.join(' ; ')}` })
+
+phase('Facts')
+const f = await relay('facts', [
+  ['head', 'git rev-parse HEAD'],
+  ['branch', 'git branch --show-current'],
+  ['remote', 'git remote get-url origin'],
+  ['status', `git status --porcelain=v1 -uall -- . ':(exclude).rbb'`],
+  ['records', `git status --porcelain=v1 -uall -- ${dir}/check.json ${dir}/review.md`],
+  ['files', 'git -c core.quotepath=false ls-files'],
+  ...SPEC_FILES.map((name, n) => [`s${n}`, `git show HEAD:${dir}/${name}`]),
+  ['build', `git show HEAD:${dir}/build.json`],
+  ['build_meta', `git show HEAD:${dir}/build-meta.json`],
+])
+if (f && f.refused) return refusedError(f)
+if (!f || !/^[0-9a-f]{40}$/.test(f.out.head)) return { change, error: 'the two relays of git facts disagreed or failed' }
+if (f.out.status) return { change, error: 'the working tree has uncommitted changes outside .rbb, which the check does not cover; commit them and run the check again', status: f.out.status }
+// Documents mode (architecture 9.1): in mode none the records are local files, and the spec must
+// have the hash it was approved with.
+const readFile = async (file, label) => { const b = await agent(`Read the file ${file} and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA_PR }); return b ? b.content : '' }
+const parse = t => { try { return t && t.trim() ? JSON.parse(t) : null } catch (e) { return null } }
+const config = parse(await readFile('.rbb/config.json', 'read config'))
+const none = documentsMode(config) === 'none'
+// The spec is rebuilt in memory from its manifest and the files it names (architecture 5.2.1).
+let texts = null, log = null, approval = null
+if (none) {
+  approval = parse(await readFile(`${dir}/approval.json`, 'read approval'))
+  if (approvalProblems(approval, change).length) return { change, error: `no valid approval for ${change}; approve the spec first` }
+  // The files the approval froze are hashed again: the manifest at approval time names them.
+  const hashed = await relay('spec hashes', [['hashes', `git hash-object ${hashedFiles(approval).map(name => `${dir}/${name}`).join(' ')}`]])
+  if (hashed && hashed.refused) return refusedError(hashed)
+  if (!hashed) return { change, error: 'the two relays of the spec hashes disagreed or failed' }
+  const changed = changedSpecFiles(approval, hashed.out.hashes)
+  if (changed.length) return { change, error: `the spec changed after it was approved (${changed.join(', ')}); approve it again` }
+  const read = await parallel(SPEC_FILES.map(name => () => readFile(`${dir}/${name}`, `read ${name}`)))
+  texts = Object.fromEntries(SPEC_FILES.map((name, n) => [name, read[n]]))
+  log = parse(buildLogText(await readFile(`${dir}/build.json`, 'read build log'), await readFile(`${dir}/build-meta.json`, 'read build meta')))
+} else {
+  texts = Object.fromEntries(SPEC_FILES.map((name, n) => [name, f.out[`s${n}`]]))
+  log = parse(buildLogText(f.out.build, f.out.build_meta))
+}
+const built = specFromTexts(change, texts)
+const spec = built.spec || null
+if (!spec || validateSpec(spec, change).length) return { change, error: `the spec is not committed at HEAD, or does not meet its format${built.error ? ` (${built.error})` : ''}; approve the spec first` }
+
+const back = await agent(`Read the file ${dir}/check.json and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label: 'read check', phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA_PR })
+let check = null
+try { check = back && back.content.trim() ? JSON.parse(back.content) : null } catch (e) { check = null }
+if (!check) return { change, error: `${dir}/check.json is missing or not JSON; run /rbb:check first` }
+if (check.verdict === 'error') return { change, error: `the last check did not complete (${check.error ? check.error.reason : 'unknown reason'}); run /rbb:check again` }
+if (!/^[0-9a-f]{40}$/.test(check.head || '')) return { change, error: 'the check does not record the commit it checked; run /rbb:check again' }
+
+// Covered: the code at the checked commit is the code at HEAD. Commits since then may only touch .rbb.
+const cov = await relay('covered', [
+  ['kind', `git cat-file -t ${check.head}`],
+  ['changed', `git -c core.quotepath=false diff --name-only ${check.head} HEAD -- . ':(exclude).rbb'`],
+  ['review', `git ls-files --others --cached -- ${dir}/review.md`],
+])
+if (cov && cov.refused) return refusedError(cov)
+if (!cov || cov.out.kind !== 'commit') return { change, error: `the checked commit ${check.head.slice(0, 10)} is not in this repository; run /rbb:check again` }
+if (cov.out.changed) return { change, error: 'the code changed after the check; run /rbb:check again', changed: cov.out.changed.split('\n') }
+const reviewText = none ? await readFile(`${dir}/review.md`, 'read review') : null
+if (none ? !reviewText.trim() : !cov.out.review) return { change, error: `${dir}/review.md is missing; run /rbb:check again` }
+
+phase('Commit')
+// In mode none nothing is committed. Otherwise the check and the review are, in the project's style.
+let committed = null, sha = null
+if (!none && f.out.records) {
+  const subject = recordsSubject(spec, config && config.commit)
+  const cmds = recordsCommands(change, subject)
+  await agent(`Run these commands:\n${cmds.map((c, n) => `${n + 1}. ${c}`).join('\n')}`, { label: 'commit records', phase: 'Commit', agentType: 'rbb:committer', effort: 'low' })
+  committed = subject
+}
+// Verified from git, not from the committer's report: the records are committed and unchanged.
+if (!none) {
+  const v = await relay('verify', [
+    ['records', `git status --porcelain=v1 -uall -- ${dir}/check.json ${dir}/review.md`],
+    ['sha', `git log -1 --format=%H -- ${dir}/review.md`],
+  ])
+  if (v && v.refused) return refusedError(v)
+  if (!v || v.out.records || !/^[0-9a-f]{40}$/.test(v.out.sha)) return { change, error: 'the check and the review could not be committed; check git status' }
+  sha = v.out.sha
+}
+
+phase('Body')
+const repo = githubRepo(f.out.remote)
+const parts = prParts(spec, check, none ? null : reviewLink(repo, sha, change))
+const tpl = findTemplate(f.out.files.split('\n').filter(Boolean))
+let body = prBody(parts)
+if (tpl.path) {
+  const t = await relay('template', [['text', `git show HEAD:${tpl.path}`]])
+  if (t && t.refused) return refusedError(t)
+  if (t && t.out.text.trim()) body = fillTemplate(t.out.text, parts, prFacts(spec, log))
+}
+// In mode none the body carries the review; when saving that is refused, the body without it is
+// saved instead and says where the review is (architecture 5.2.1).
+const reduced = none ? body + noneAppendix(null, approval.hashes, `${dir}/review.md`) : null
+if (none) body += noneAppendix(reviewText, approval.hashes)
+const recorded = await recordPage(`${dir}/pr.md`, body, reduced, 'Body')
+if (!recorded) return { change, error: `${dir}/pr.md could not be saved and verified` }
+
+const branch = f.out.branch
+const style = config && config.branch
+return {
+  change,
+  body: `${dir}/pr.md`,
+  body_complete: recorded === 'full',
+  title: prTitle(spec),
+  documents: none ? 'none' : 'committed',
+  records_commit: sha,
+  records_committed_now: committed,
+  template: tpl.path,
+  template_note: tpl.note,
+  github: repo,
+  branch: branch || null,
+  // On a default branch, a pull request needs a branch of its own, named by the project's convention.
+  needs_branch: !branch || DEFAULT_BRANCH.test(branch),
+  suggested_branch: style && style.kind === 'prefix' && style.prefix ? `${style.prefix}${change}` : change,
+}
