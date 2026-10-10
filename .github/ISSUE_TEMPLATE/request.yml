@@ -1,0 +1,23 @@
+name: A change to RBB
+description: Something RBB should do, stop doing, or do differently.
+labels: [request]
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What should be different
+      description: The outcome you want, in observable terms, with no solution in it. If you have a fix in mind, say what the fix is for.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What happened, or keeps happening, that this would change. A record from `.rbb/<change>/` that shows it is worth more than a description of it.
+    validations:
+      required: true
+  - type: textarea
+    id: not
+    attributes:
+      label: What must not change
+      description: Anything RBB does today that this must keep doing, in your words.

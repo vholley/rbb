@@ -1,0 +1,57 @@
+name: Something went wrong
+description: A step of RBB failed, stopped, or did something other than what the documentation says.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. The records RBB wrote are the evidence; the more of them you can paste, the faster this gets fixed. Nothing here is read by an agent, so write it for a person.
+  - type: dropdown
+    id: step
+    attributes:
+      label: Which step
+      options:
+        - /rbb:rbb (the whole flow)
+        - /rbb:goal
+        - /rbb:approve
+        - /rbb:build
+        - /rbb:check
+        - /rbb:pr
+        - /rbb:clear
+        - /rbb:status
+        - /rbb:documents
+        - Installing or loading the plugin
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what RBB said or did, and what you expected instead. Paste the workflow's result as it was written, or the error.
+    validations:
+      required: true
+  - type: textarea
+    id: records
+    attributes:
+      label: The records
+      description: Whatever applies from `.rbb/<change>/`, pasted or attached. Most often `spec.md`, `review.md`, `build.json` or `check.json`. Remove anything private first.
+      render: text
+  - type: input
+    id: mode
+    attributes:
+      label: Documents mode
+      description: committed, or none (`documents` in `.rbb/config.json`)
+      placeholder: committed
+  - type: input
+    id: version
+    attributes:
+      label: Versions
+      description: RBB's version (`plugin/.claude-plugin/plugin.json`, or the release tag), Claude Code's (`claude --version`), and your operating system.
+      placeholder: RBB 0.1.0, Claude Code 2.x, Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: rules
+    attributes:
+      label: Permission rules and tools that hold commands
+      description: Any `permissions.allow` rules you added for RBB, and any tool that holds commands for confirmation. A held command makes a workflow wait silently, which can look like a hang.
