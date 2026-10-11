@@ -75,6 +75,8 @@ function validateGoal(g) {
   if (g.v !== SPEC_V) errs.push(`v: expected ${SPEC_V}`)
   if (!isStr(g.title)) errs.push('title: missing')
   if (!isStr(g.source_request)) errs.push('source_request: missing')
+  // The reading (one sentence saying how the request is taken) came later: goals without one still read.
+  if (g.reading !== undefined && !isStr(g.reading)) errs.push('reading: must be one sentence')
   const ids = goalItems(g, errs)
   // Other goals found in the same request, each to be shaped as its own change. Optional.
   if (g.split_off !== undefined && !(Array.isArray(g.split_off) && g.split_off.every(x => isStr(x && x.goal)))) errs.push('split_off: must be a list of {goal}')
@@ -114,6 +116,7 @@ function validateSpec(spec, change) {
   const errs = []
   if (spec.v !== SPEC_V) errs.push(`v: expected ${SPEC_V}`)
   if (spec.change !== change) errs.push(`change: expected ${change}, found ${spec.change}`)
+  if (spec.reading !== undefined && !isStr(spec.reading)) errs.push('reading: must be one sentence')
   if (!/^[0-9a-f]{7,40}$/.test(spec.base || '')) errs.push('base: must be a commit id')
   const ids = goalItems(spec, errs)
   if (!Array.isArray(spec.decisions)) errs.push('decisions: must be a list')
@@ -189,6 +192,9 @@ function items(list, withWhy) {
 // The request as written: a plain quoted section, last on the page, readable in any markdown viewer.
 // Its heading is fixed so the reading-length check can leave it out, as is the Examined list's.
 const REQUEST_HEADING = '## The request as written'
+// The reading: one sentence saying how the request is taken, first on the page, so that a wrong one
+// is the first thing the requester sees and rejects.
+const READING_HEADING = '## How the request is read'
 const EXAMINED_HEADING = '## Examined'
 const FOLLOW_UPS_HEADING = '## Found along the way, not part of this change'
 const IMPACT_HEADING = '## What the change touches'
@@ -292,6 +298,7 @@ function questionLines(q, n) {
 function goalPage(g) {
   const parts = [
     `# ${g.title}`,
+    ...(g.reading ? [`${READING_HEADING}\n\n${oneLine(g.reading)}`] : []),
     `## Goal\n\n${g.goal}`,
     `## Done when\n\n${items(g.done_when)}`,
     `## Constraints\n\n${items(g.constraints)}`,
@@ -541,6 +548,7 @@ function specPage(s, opts = {}) {
   ].filter(Boolean).join('\n')
   const parts = [
     `# ${s.title || s.change}`,
+    ...(s.reading ? [`${READING_HEADING}\n\n${oneLine(s.reading)}`] : []),
     `## Goal\n\n${s.goal}`,
     `## Done when\n\n${items(s.done_when)}`,
     `## Constraints\n\n${items(s.constraints)}`,
@@ -900,8 +908,16 @@ async function writeSettings(path, text, settings) {
   return `${path} could not be read back as written`
 }
 
+// When the write is refused (Claude Code's auto mode denies a settings write without asking), the
+// requester gets commands that write the same merged file, one per shell, to run if they choose.
+const commandsFor = (path, text) => ({
+  bash: `mkdir -p .claude && cat > ${path} <<'EOF'\n${text.trimEnd()}\nEOF`,
+  powershell: `New-Item -ItemType Directory -Force .claude | Out-Null\n[IO.File]::WriteAllText("$PWD/${path}", @'\n${text.trimEnd()}\n'@ + "\`n")`,
+})
+
 phase('Record')
 let permissions = { file: null }
+let commands
 if (target !== 'none') {
   const merged = mergeAllow(files[target] || '', rules, allowList(files[other] || ''))
   if (merged.error) permissions = { file: target, error: `${target} ${merged.error}` }
@@ -909,12 +925,13 @@ if (target !== 'none') {
   else {
     const problem = await writeSettings(target, merged.text, merged.settings)
     permissions = problem ? { file: target, error: problem } : { file: target, added: merged.added }
+    if (problem) commands = commandsFor(target, merged.text)
   }
   if (target === LOCAL) permissions.ignored = String(a.ignored || '').trim() !== ''
 }
 const shown = permissions.file === null || permissions.error ? rules : undefined
 
-if (questions.length) return { questions, permissions, ...(shown ? { rules: shown } : {}), detected: { commit, branch, tests } }
+if (questions.length) return { questions, permissions, ...(shown ? { rules: shown } : {}), ...(commands ? { commands } : {}), detected: { commit, branch, tests } }
 
 // Mode none: written first, so config.json itself is never seen by git.
 if (mode === 'none' && files['.rbb/.gitignore'] === undefined) {
@@ -931,4 +948,4 @@ if (recorded !== true) return { error: '.rbb/config.json could not be saved and 
 // Nothing is deleted by a step that was not asked to delete: a repository moved from mode none to
 // committed keeps the .gitignore that hides its records until the requester removes it.
 const note = mode === 'committed' && files['.rbb/.gitignore'] !== undefined ? '.rbb/.gitignore, left by documents mode none, still keeps every RBB file out of git: remove it so that the records can be committed' : undefined
-return { config, documents: mode, permissions, ...(shown ? { rules: shown } : {}), ...(note ? { note } : {}) }
+return { config, documents: mode, permissions, ...(shown ? { rules: shown } : {}), ...(commands ? { commands } : {}), ...(note ? { note } : {}) }

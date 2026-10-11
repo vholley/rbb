@@ -18,7 +18,7 @@ Arguments: $ARGUMENTS
    - the documents mode, and for `none` that `.rbb/.gitignore` now keeps every RBB file out of git, itself included;
    - the commit style and the branch naming from `config`, and whether they were detected from the history or chosen (`by`);
    - the test command from `config.test`, or that none is allowed;
-   - the permission rules: when `permissions.added` lists rules, how many were added to which file; when it is empty, that the file already held them all; when `permissions.file` is null or `permissions.error` is set, say why nothing was written (the error as written, or that they chose so) and show `rules` as a JSON `permissions.allow` list for them to add by hand;
+   - the permission rules: when `permissions.added` lists rules, how many were added to which file; when it is empty, that the file already held them all; when `permissions.error` is set, say the error as written, then that the command below writes the same file, with the rules added and nothing else changed, if they choose to run it, and show `commands.powershell` on Windows or `commands.bash` elsewhere, exactly as written, in one fenced code block tagged with that shell's name (the other on request); when `permissions.file` is null, say that they chose so and show `rules` as a JSON `permissions.allow` list;
    - when `permissions.ignored` is false, that git does not ignore `.claude/settings.local.json`, so it may want a line in `.gitignore`;
    - when the result has a `note`, the note as written;
    - that the GitHub CLI, signed in, is needed only to post pull requests from inside RBB.

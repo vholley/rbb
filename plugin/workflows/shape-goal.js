@@ -75,6 +75,8 @@ function validateGoal(g) {
   if (g.v !== SPEC_V) errs.push(`v: expected ${SPEC_V}`)
   if (!isStr(g.title)) errs.push('title: missing')
   if (!isStr(g.source_request)) errs.push('source_request: missing')
+  // The reading (one sentence saying how the request is taken) came later: goals without one still read.
+  if (g.reading !== undefined && !isStr(g.reading)) errs.push('reading: must be one sentence')
   const ids = goalItems(g, errs)
   // Other goals found in the same request, each to be shaped as its own change. Optional.
   if (g.split_off !== undefined && !(Array.isArray(g.split_off) && g.split_off.every(x => isStr(x && x.goal)))) errs.push('split_off: must be a list of {goal}')
@@ -114,6 +116,7 @@ function validateSpec(spec, change) {
   const errs = []
   if (spec.v !== SPEC_V) errs.push(`v: expected ${SPEC_V}`)
   if (spec.change !== change) errs.push(`change: expected ${change}, found ${spec.change}`)
+  if (spec.reading !== undefined && !isStr(spec.reading)) errs.push('reading: must be one sentence')
   if (!/^[0-9a-f]{7,40}$/.test(spec.base || '')) errs.push('base: must be a commit id')
   const ids = goalItems(spec, errs)
   if (!Array.isArray(spec.decisions)) errs.push('decisions: must be a list')
@@ -189,6 +192,9 @@ function items(list, withWhy) {
 // The request as written: a plain quoted section, last on the page, readable in any markdown viewer.
 // Its heading is fixed so the reading-length check can leave it out, as is the Examined list's.
 const REQUEST_HEADING = '## The request as written'
+// The reading: one sentence saying how the request is taken, first on the page, so that a wrong one
+// is the first thing the requester sees and rejects.
+const READING_HEADING = '## How the request is read'
 const EXAMINED_HEADING = '## Examined'
 const FOLLOW_UPS_HEADING = '## Found along the way, not part of this change'
 const IMPACT_HEADING = '## What the change touches'
@@ -292,6 +298,7 @@ function questionLines(q, n) {
 function goalPage(g) {
   const parts = [
     `# ${g.title}`,
+    ...(g.reading ? [`${READING_HEADING}\n\n${oneLine(g.reading)}`] : []),
     `## Goal\n\n${g.goal}`,
     `## Done when\n\n${items(g.done_when)}`,
     `## Constraints\n\n${items(g.constraints)}`,
@@ -541,6 +548,7 @@ function specPage(s, opts = {}) {
   ].filter(Boolean).join('\n')
   const parts = [
     `# ${s.title || s.change}`,
+    ...(s.reading ? [`${READING_HEADING}\n\n${oneLine(s.reading)}`] : []),
     `## Goal\n\n${s.goal}`,
     `## Done when\n\n${items(s.done_when)}`,
     `## Constraints\n\n${items(s.constraints)}`,
@@ -599,6 +607,7 @@ const SLUG = /^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$/
 const GOAL_SCHEMA = { type: 'object', properties: {
   title: { type: 'string', description: 'one line' },
   goal: { type: 'string', description: 'the outcome, in observable terms, with no solution in it' },
+  reading: { type: 'string', description: 'one sentence saying how the request is read: what the change belongs to and what it does not touch; the sentence the requester would have to disagree with if the reading is wrong' },
   done_when: { type: 'array', minItems: 1, items: { type: 'object', properties: { id: { type: 'string', pattern: '^E[0-9]+$' }, text: { type: 'string', description: 'a concrete input and the expected result' } }, required: ['id', 'text'] } },
   constraints: { type: 'array', items: { type: 'object', properties: { id: { type: 'string', pattern: '^C[0-9]+$' }, text: { type: 'string' } }, required: ['id', 'text'] } },
   out_of_scope: { type: 'array', items: { type: 'object', properties: { id: { type: 'string', pattern: '^O[0-9]+$' }, text: { type: 'string' } }, required: ['id', 'text'] } },
@@ -606,16 +615,16 @@ const GOAL_SCHEMA = { type: 'object', properties: {
   split_off: { type: 'array', description: 'other goals in the same request, each able to be done and reviewed on its own; one line each', items: { type: 'object', properties: { goal: { type: 'string' } }, required: ['goal'] } },
   questions: { type: 'array', description: 'only what turns on the requester\'s intention and cannot be settled from the request', items: { type: 'object', properties: {
     question: { type: 'string', description: 'the question, naming the piece of the change it is about' },
-    options: { type: 'array', minItems: 2, description: 'the real answers: each one a way the requester could decide that still meets the request', items: { type: 'object', properties: { option: { type: 'string', description: 'the answer, in a few words' }, means: { type: 'string', description: 'what choosing it would mean for the change, in one sentence' } }, required: ['option', 'means'] } },
+    options: { type: 'array', minItems: 2, description: 'the real answers: each one a way the requester could decide that still meets the request; when the question asks who chooses, owns or sets something, one of them says that nobody does and it is a property of the thing itself', items: { type: 'object', properties: { option: { type: 'string', description: 'the answer, in a few words' }, means: { type: 'string', description: 'what choosing it would mean for the change, in one sentence' } }, required: ['option', 'means'] } },
     recommendation: { type: 'string', description: 'one of the options, word for word' },
-    because: { type: 'string', description: 'why that one rather than the others, in terms of the request: what it asks for, what its example shows, what it would leave undone' },
+    because: { type: 'string', description: 'why that one rather than the others, in terms of the request: what it asks for, what its example shows, what it would leave undone; never the name of a thing' },
     affects: { type: 'string', description: 'what the answer changes elsewhere: documentation, other behaviour, a later decision; empty when nothing' },
   }, required: ['question', 'options', 'recommendation', 'because', 'affects'] } },
 }, required: ['title', 'goal', 'done_when', 'constraints', 'out_of_scope', 'agreed_extras', 'split_off', 'questions'] }
 
 // The saved goal: the shaper's fields, plus what code stamps (version, the request as written).
 function toGoal(draft, request) {
-  const g = { v: 1, title: draft.title, goal: draft.goal, done_when: draft.done_when, constraints: draft.constraints, out_of_scope: draft.out_of_scope, source_request: request, questions: draft.questions }
+  const g = { v: 1, title: draft.title, goal: draft.goal, reading: draft.reading, done_when: draft.done_when, constraints: draft.constraints, out_of_scope: draft.out_of_scope, source_request: request, questions: draft.questions }
   if (draft.agreed_extras && draft.agreed_extras.length) g.agreed_extras = draft.agreed_extras
   if (draft.split_off && draft.split_off.length) g.split_off = draft.split_off
   return g
@@ -680,8 +689,12 @@ if (answers.length) {
   if (!previous) throw new Error(`answers were given but ${dir}/goal.json could not be read`)
 }
 
+// An answer in the requester's own words, not one of the question's options, is where a reading goes
+// wrong unnoticed: the shaper must say what it takes it to mean, and ask when it could mean two things.
+const ownWords = previous ? answers.filter(a => { const q = (previous.questions || []).find(x => x.question === a.question); return !q || !(q.options || []).some(o => o.option === a.answer) }) : []
+const ownWordsNote = ownWords.length ? `\n\nThese answers are in the requester's own words, not one of the options offered: ${ownWords.map(a => `"${oneLine(a.answer)}"`).join('; ')}. Say in the reading what you take each to mean. If one admits more than one meaning that would change the goal, ask which, with each meaning as an option in one sentence, and settle nothing else on it until then.` : ''
 const task = previous
-  ? `Revise this goal with the requester's answers. When an answer agrees to something beyond the request, record it as an agreed extra (X1, X2...) with why it is here rather than a follow-up. When an answer asks for a change to the spec (the question "What should change in the spec?"), add it to the goal in the requester's own words, never reworded: as a new constraint (C...) when it says what must hold or must not change, as a new example (E...) when it gives an input and a result, as a new exclusion (O...) when it says what not to do; so that the check and the pull request hold it as their request, not as your restatement. Their answers stand; do not ask them again. An answer of "you decide", or bare agreement, means your recommendation. Keep every item that the answers do not change, with its id.\n\nThe goal:\n${JSON.stringify(previous, null, 2)}\n\nThe answers:\n${JSON.stringify(answers, null, 2)}`
+  ? `Revise this goal with the requester's answers. When an answer agrees to something beyond the request, record it as an agreed extra (X1, X2...) with why it is here rather than a follow-up. When an answer asks for a change to the spec (the question "What should change in the spec?"), add it to the goal in the requester's own words, never reworded: as a new constraint (C...) when it says what must hold or must not change, as a new example (E...) when it gives an input and a result, as a new exclusion (O...) when it says what not to do; so that the check and the pull request hold it as their request, not as your restatement. Their answers stand; do not ask them again. An answer of "you decide", or bare agreement, means your recommendation. Keep every item that the answers do not change, with its id.\n\nThe goal:\n${JSON.stringify(previous, null, 2)}\n\nThe answers:\n${JSON.stringify(answers, null, 2)}${ownWordsNote}`
   : `Shape this request into a goal. Number examples E1, E2..., constraints C1..., and exclusions O1....\n\nThe request, as the requester wrote it:\n${request}`
 
 let goal = null, problems = []
@@ -691,10 +704,11 @@ for (let attempt = 1; attempt <= 2 && !goal; attempt++) {
   const g = toGoal(draft, request)
   // A new draft's questions must carry their options, reason and effects (strict); the saved goal
   // is validated leniently, so older goals still read.
-  problems = [...validateGoal(g), ...questionProblems(g.questions)]
+  problems = [...validateGoal(g), ...questionProblems(g.questions), ...(isStr(g.reading) ? [] : ['reading: missing; one sentence saying how the request is read'])]
   if (problems.length) continue
   // Items cited by code: ask once to rephrase; on the second draft accept and note it.
-  const mentions = mentionProblems(g)
+  // The reading is text a person reads: a statement about the request, not the shaper speaking.
+  const mentions = [...mentionProblems(g), ...(/(^|[^A-Za-z])I\b/.test(g.reading || '') ? ['reading: write it as a statement about the request, not in the first person'] : [])]
   if (mentions.length && attempt === 1) { problems = mentions; continue }
   if (mentions.length) log(`kept despite: ${mentions.join('; ')}`)
   goal = g
