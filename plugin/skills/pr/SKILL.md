@@ -8,7 +8,7 @@ Arguments: $ARGUMENTS
 
 The first word of the arguments is the change name. The second word, when it is `post`, asks to post the pull request. Nothing else is an argument.
 
-1. Run the plugin workflow `rbb:pr` with the Workflow tool, with args `{"change": "<the change name>"}` (an object with the change name alone, never the whole argument text), and wait. Do not write any file yourself.
+1. Run the plugin workflow `rbb:write-pr` with the Workflow tool, with args `{"change": "<the change name>"}` (an object with the change name alone, never the whole argument text), and wait. Do not write any file yourself.
 2. If it returned an error, show the error as written and stop.
 3. Show the requester the title it returned and `.rbb/<change>/pr.md` exactly as written. Add nothing of your own, except, when `body_complete` is false, that the review could not be included in the body and stays in `.rbb/<change>/review.md`.
 4. Post only if the requester asked to: the second argument is `post`, or they asked in their own words to open, create, post or update the pull request. Otherwise, end by giving them the commands from step 6 to run when they choose, and stop.

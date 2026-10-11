@@ -1,10 +1,11 @@
 export const meta = {
-  name: 'setup',
-  description: "RBB: settle once what a repository needs: the documents mode, the permission rules written where the requester chose, the commit style and branch naming from the history, and the test command; saves .rbb/config.json",
-  whenToUse: 'Started by the setup skill, which the goal and approve skills invoke when .rbb/config.json does not exist; not for direct use.',
+  name: 'write-pr',
+  description: 'RBB: commit the check and the review, and write the pull request body as .rbb/<change>/pr.md, filled into the project template. Posts nothing.',
+  whenToUse: 'Started by the /rbb:pr skill after a check; not for direct use.',
   phases: [
-    { title: 'Detect', detail: 'history, root listing and settings files relayed twice from git and compared; styles and test commands recognised by code' },
-    { title: 'Record', detail: 'the permission rules, .rbb/.gitignore in mode none, and config.json, each written and read back' },
+    { title: 'Facts', detail: 'git facts relayed twice; the check must cover the current code' },
+    { title: 'Commit', detail: 'check.json and review.md committed and verified from git' },
+    { title: 'Body', detail: 'the short body written by code into the project template, saved and read back' },
   ],
 }
 
@@ -594,214 +595,301 @@ function commitSubject(prefix, title) {
 }
 // </lib:spec>
 
-// <lib:conventions> copied from src/lib/conventions.js by tools/sync-lib.mjs; edit the source, not this copy
-// The repository's conventions and RBB's setup (architecture 9.2 and 10): the commit style and the
-// branch naming counted from real history, the test command recognised from the root listing, the
-// permission rules RBB needs, and the merge of those rules into a Claude Code settings file.
-// Pure functions only. Workflow scripts cannot import, so this file is copied into a marked region
-// of each workflow that needs it by tools/sync-lib.mjs; tests/check/unit.mjs fails if any copy differs.
+// <lib:build> copied from src/lib/build.js by tools/sync-lib.mjs; edit the source, not this copy
+// The builder's log (architecture 5.3): its schema, validation and page. Pure functions only.
+// Needs the spec library (copied before this one): ID, KIND, num, refs, oneLine.
 
-const CONVENTIONAL = /^([a-z]+)(\(([^)]+)\))?!?: \S/
-const CLEAR_YES = 0.7
-const CLEAR_NO = 0.2
+const BUILD_KINDS = ['evidence', 'decision', 'deviation', 'claim']
 
-// Commit style from recent subjects, by counting. Merge commits and bot updates are left out.
-function detectCommitStyle(subjects) {
-  const s = subjects.map(x => x.trim()).filter(x => x && !/^Merge /.test(x) && !/^\[pre-commit\.ci\]/.test(x))
-  const conv = s.map(x => CONVENTIONAL.exec(x)).filter(Boolean)
-  const share = s.length ? conv.length / s.length : 0
-  const evidence = { conventional: conv.length, total: s.length }
-  const types = conv.map(m => m[1])
-  const type = types.includes('docs') ? 'docs' : types.includes('chore') ? 'chore' : (types[0] || 'docs')
-  if (s.length < 5) return { kind: 'unclear', evidence, recommend: { kind: 'plain' } }
-  if (share >= CLEAR_YES) return { kind: 'conventional', type, evidence }
-  if (share <= CLEAR_NO) return { kind: 'plain', evidence }
-  return { kind: 'unclear', evidence, recommend: share >= 0.5 ? { kind: 'conventional', type } : { kind: 'plain' } }
+// The log as the builder answers it, through a schema built from the approved spec: it can cite
+// only examples, steps and items that exist.
+function BUILD_SCHEMA(spec) {
+  const eIds = spec.done_when.map(i => i.id)
+  const pIds = spec.plan.steps.map(p => p.id)
+  const itemIds = [...eIds, ...spec.constraints.map(i => i.id), ...spec.out_of_scope.map(i => i.id), ...(spec.agreed_extras || []).map(i => i.id), ...spec.decisions.map(d => d.id)]
+  const s = d => ({ type: 'string', description: d })
+  return { type: 'object', properties: {
+    evidence: { type: 'array', items: { type: 'object', properties: { item: { type: 'string', enum: eIds }, before: s('what the example gave before the change'), after: s('what it gives after'), how: s('the command or check that showed it') }, required: ['item', 'before', 'after', 'how'] } },
+    decisions: { type: 'array', items: { type: 'object', properties: { serves: { type: 'array', items: { type: 'string', enum: itemIds } }, choice: s(''), because: s(''), alternatives: { type: 'array', description: REAL_ALTERNATIVE, items: { type: 'object', properties: { option: s(''), why_not: s('') }, required: ['option', 'why_not'] } }, would_change_if: s('what would make another choice right; empty if nothing would'), basis: { type: 'string', enum: BASES, description: 'the criterion that settled it' } }, required: ['serves', 'choice', 'because', 'alternatives', 'would_change_if', 'basis'] } },
+    deviations: { type: 'array', items: { type: 'object', properties: { step: { type: 'string', enum: pIds }, planned: s('what the plan said'), actual: s('what was done instead'), because: s('') }, required: ['step', 'planned', 'actual', 'because'] } },
+    claims: { type: 'array', items: s('one thing the change does, checkable against the diff') },
+  }, required: ['evidence', 'decisions', 'deviations', 'claims'] }
 }
 
-// Branch naming: a shared prefix only when at least half the working branches use one.
-// Default and remote-tracking names, release lines and bot branches are left out.
-function detectBranchStyle(branches) {
-  const names = [...new Set(branches.map(b => b.trim().replace(/^origin\//, '')).filter(b => b && b !== 'origin' && !/^(HEAD|main|master|develop|trunk)$/.test(b) && !/^(dependabot|renovate|release|maintain)[/-]/.test(b)))]
-  const prefixed = names.map(n => /^([a-z]+)\//.exec(n)).filter(Boolean).map(m => m[1])
-  const counts = prefixed.reduce((c, p) => ({ ...c, [p]: (c[p] || 0) + 1 }), {})
-  const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]
-  if (names.length >= 3 && top && top[1] / names.length >= 0.5) return { kind: 'prefix', prefix: `${top[0]}/`, evidence: { prefixed: top[1], total: names.length } }
-  return { kind: 'plain', evidence: { prefixed: top ? top[1] : 0, total: names.length } }
+// The saved log: the builder's answer with ids and who decided stamped by code. The model and
+// effort are the ones the workflow started the builder with, never the builder's own claim.
+function toBuildLog(answer, run) {
+  let n = 0
+  const id = () => `B${++n}`
+  // The model and effort are stamped by code; the basis is the builder's own answer, from a fixed list.
+  const by = { by: 'model', model: run.model, effort: run.effort, ...(run.alias ? { alias: true } : {}) }
+  return { v: 1, entries: [
+    ...answer.evidence.map(e => ({ kind: 'evidence', ...e })),
+    ...answer.decisions.map(({ basis, ...d }) => ({ kind: 'decision', id: id(), ...d, decided_by: { ...by, basis } })),
+    ...answer.deviations.map(d => ({ kind: 'deviation', id: id(), ...d, decided_by: by })),
+    ...answer.claims.map(t => ({ kind: 'claim', text: t })),
+  ] }
 }
 
-function branchName(style, change) {
-  return style && style.kind === 'prefix' ? `${style.prefix}${change}` : change
+// The builder saves its own answer (build.json); what code adds is kept apart in build-meta.json:
+// the model and effort that ran it, and which alternatives the independent review kept (architecture
+// 5.2.1). Readers rebuild the log in memory.
+function composeBuildLog(answer, meta) {
+  const log = toBuildLog(answer, (meta && meta.run) || {})
+  const review = (meta && meta.review) || null
+  let i = -1
+  log.entries = log.entries.map(e => {
+    if (e.kind !== 'decision') return e
+    i++
+    const alts = e.alternatives || []
+    if (!alts.length) return e
+    if (!review) return { ...e, alternatives_reviewed: false }
+    const keep = review.keep[i] || []
+    return { ...e, alternatives: alts.filter((a, j) => keep[j] !== false), alternatives_reviewed_by: review.by }
+  })
+  return log
 }
 
-// The permission rule that lets an agent run a command and its arguments: the command's words,
-// then anything. "go test ./..." allows every package, so the rule stops at the sub-command.
-const ruleFor = command => `Bash(${String(command).trim().replace(/\s+\.\/\.\.\.$/, '')}:*)`
-
-// The test commands recognised from the names at the repository's root, first match recommended.
-// `found` names the file that gave the command away, for the question's options.
-const TEST_COMMANDS = [
-  { file: 'poetry.lock', needs: ['pyproject.toml'], command: 'poetry run pytest' },
-  { file: 'uv.lock', needs: ['pyproject.toml'], command: 'uv run pytest' },
-  { file: 'pyproject.toml', command: 'python -m pytest' },
-  { file: 'pytest.ini', command: 'python -m pytest' },
-  { file: 'setup.cfg', command: 'python -m pytest' },
-  { file: 'conftest.py', command: 'python -m pytest' },
-  { file: 'tox.ini', command: 'tox' },
-  { file: 'pnpm-lock.yaml', needs: ['package.json'], command: 'pnpm test' },
-  { file: 'yarn.lock', needs: ['package.json'], command: 'yarn test' },
-  { file: 'bun.lockb', needs: ['package.json'], command: 'bun test' },
-  { file: 'bun.lock', needs: ['package.json'], command: 'bun test' },
-  { file: 'package.json', command: 'npm test' },
-  { file: 'Cargo.toml', command: 'cargo test' },
-  { file: 'go.mod', command: 'go test ./...' },
-  { file: 'pom.xml', command: 'mvn test' },
-  { file: 'gradlew', command: './gradlew test' },
-  { file: 'build.gradle', command: 'gradle test' },
-  { file: 'build.gradle.kts', command: 'gradle test' },
-  { file: 'mix.exs', command: 'mix test' },
-  { pattern: /\.(sln|csproj|fsproj)$/, command: 'dotnet test' },
-]
-
-// rootListing: the names at the root, one per line (git ls-tree --name-only HEAD).
-// makefileTest: grep's output for a `test:` target in the Makefile; empty when there is none.
-function detectTestCommand(rootListing, makefileTest) {
-  const names = new Set(String(rootListing || '').split('\n').map(s => s.trim()).filter(Boolean))
-  const candidates = []
-  const seen = new Set()
-  const add = (command, found) => { if (!seen.has(command)) { seen.add(command); candidates.push({ command, rule: ruleFor(command), found }) } }
-  for (const t of TEST_COMMANDS) {
-    const hit = t.pattern ? [...names].find(n => t.pattern.test(n)) : names.has(t.file) ? t.file : null
-    if (!hit || (t.needs || []).some(n => !names.has(n))) continue
-    // gradle test is for a project without the wrapper; the wrapper is the convention when present.
-    if (t.command === 'gradle test' && names.has('gradlew')) continue
-    add(t.command, hit)
-  }
-  if (String(makefileTest || '').trim()) add('make test', 'Makefile')
-  return { candidates, recommend: candidates.length ? candidates[0].command : null }
+// The log as text, from build.json and build-meta.json; empty when there is none. A build.json from
+// before the split is a log already.
+function buildLogText(buildText, metaText) {
+  const parse = t => { try { return t && String(t).trim() ? JSON.parse(t) : null } catch (e) { return null } }
+  const b = parse(buildText)
+  if (!b) return String(buildText || '').trim() ? String(buildText) : ''
+  if (Array.isArray(b.entries)) return JSON.stringify(b)
+  return JSON.stringify(composeBuildLog(b, parse(metaText)))
 }
 
-// The rules RBB needs so that only decisions ask (architecture 9.2; the user guide's table says who
-// runs what). The commands that are decisions are never here: git rm, git clean, git switch -c,
-// git push, gh.
-const RBB_RULES = [
-  'Skill',
-  ...['goal', 'scout', 'specify', 'setup', 'approve', 'build', 'check', 'pr', 'clear', 'status'].map(w => `Workflow(rbb:${w})`),
-  ...['status', 'log', 'show', 'diff', 'rev-parse', 'hash-object', 'ls-files', 'ls-tree', 'cat-file', 'branch', 'symbolic-ref', 'remote', 'check-ignore', '-c', 'add', 'commit'].map(c => `Bash(git ${c}:*)`),
-  'Bash(tail:*)',
-  'Bash(grep:*)',
-]
-// Every rule to have in force: RBB's own and the test command's, when there is one.
-const permissionRules = testRule => (testRule ? [...RBB_RULES, testRule] : [...RBB_RULES])
-
-// The allow list a settings file holds, or none when it is missing or does not parse.
-function allowList(text) {
-  try {
-    const o = JSON.parse(text)
-    return o && o.permissions && Array.isArray(o.permissions.allow) ? o.permissions.allow.filter(r => typeof r === 'string') : []
-  } catch (e) { return [] }
-}
-
-// The settings file with the missing rules appended to permissions.allow and nothing else changed:
-// `text` is the file as it is ('' when it does not exist), `alsoAllowed` the rules the other project
-// settings file already holds, which need no second copy. A file that does not parse is not touched.
-function mergeAllow(text, rules, alsoAllowed) {
-  let settings = {}
-  if (String(text || '').trim()) {
-    try { settings = JSON.parse(text) } catch (e) { return { error: 'is not valid JSON, so RBB left it alone' } }
-    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return { error: 'does not hold a JSON object, so RBB left it alone' }
-  }
-  const permissions = settings.permissions && typeof settings.permissions === 'object' && !Array.isArray(settings.permissions) ? settings.permissions : {}
-  const allow = Array.isArray(permissions.allow) ? permissions.allow : []
-  const have = new Set([...allow, ...(alsoAllowed || [])])
-  const added = rules.filter(r => !have.has(r))
-  const next = { ...settings, permissions: { ...permissions, allow: [...allow, ...added] } }
-  return { settings: next, text: JSON.stringify(next, null, 2) + '\n', added }
-}
-
-function toConfig(commit, branch, by, documents, test, permissions) {
+// The log as committed. Empty text means no log. With the spec, references are checked too:
+// evidence names a real example, a deviation a real step, a decision real items.
+// Claims get ids K1, K2, ... in log order so the claims judge answers by id.
+function parseBuild(text, spec) {
+  const empty = { entries: [], claims: [], deviations: [], decisions: [], evidence: [], errors: [] }
+  if (!text.trim()) return empty
+  let b
+  try { b = JSON.parse(text) } catch (e) { return { ...empty, errors: [`build.json is not valid JSON: ${e.message}`] } }
+  const errors = []
+  if (!b || b.v !== 1 || !Array.isArray(b.entries)) return { ...empty, errors: ['build.json: expected {"v": 1, "entries": [...]}'] }
+  const eIds = spec ? new Set(spec.done_when.map(i => i.id)) : null
+  const pIds = spec ? new Set(spec.plan.steps.map(p => p.id)) : null
+  const items = spec ? new Set([...spec.done_when, ...spec.constraints, ...spec.out_of_scope, ...(spec.agreed_extras || []), ...spec.decisions].map(i => i.id)) : null
+  b.entries.forEach((e, n) => {
+    const at = `build.json entries[${n}]`
+    if (!e || !BUILD_KINDS.includes(e.kind)) errors.push(`${at}: kind must be one of ${BUILD_KINDS.join(', ')}`)
+    else if ((e.kind === 'decision' || e.kind === 'deviation') && !/^B\d+$/.test(e.id || '')) errors.push(`${at}: a ${e.kind} needs an id B1, B2, ...`)
+    else if (e.kind === 'claim' && !(typeof e.text === 'string' && e.text.trim())) errors.push(`${at}: a claim needs text`)
+    else if (spec && e.kind === 'evidence' && !eIds.has(e.item)) errors.push(`${at}: evidence for ${e.item}, which is not an example of the spec`)
+    else if (spec && e.kind === 'deviation' && !pIds.has(e.step)) errors.push(`${at}: a deviation from ${e.step}, which is not a step of the plan`)
+    else if (spec && e.kind === 'decision' && Array.isArray(e.serves) && e.serves.some(x => !items.has(x))) errors.push(`${at}: a decision serving an item the spec does not have`)
+  })
+  const bIds = b.entries.filter(e => e && e.id).map(e => e.id)
+  const dup = bIds.filter((x, n) => bIds.indexOf(x) !== n)
+  if (dup.length) errors.push(`build.json: duplicate ids ${[...new Set(dup)].join(', ')}`)
+  const ok = b.entries.filter(e => e && BUILD_KINDS.includes(e.kind))
   return {
-    v: 1,
-    ...(documents === 'none' ? { documents: 'none' } : {}),
-    commit: { kind: commit.kind, ...(commit.type ? { type: commit.type } : {}) },
-    branch: { kind: branch.kind, ...(branch.prefix ? { prefix: branch.prefix } : {}) },
-    by,
-    ...(test ? { test: { command: test.command, rule: test.rule, by: test.by } } : {}),
-    ...(permissions ? { permissions } : {}),
-    evidence: { commit: commit.evidence, branch: branch.evidence },
+    entries: ok,
+    claims: ok.filter(e => e.kind === 'claim').map((e, n) => ({ id: `K${n + 1}`, text: e.text })),
+    deviations: ok.filter(e => e.kind === 'deviation'),
+    decisions: ok.filter(e => e.kind === 'decision'),
+    evidence: ok.filter(e => e.kind === 'evidence'),
+    errors,
   }
 }
-// </lib:conventions>
 
-// tail -v -n +1 <files> prints each file under a "==> path <==" header: the files by path.
-function splitTail(text) {
-  const out = {}
-  let cur = null
-  for (const line of String(text || '').split('\n')) {
-    const m = /^==> (.+) <==$/.exec(line)
-    if (m) { cur = m[1].replace(/\\/g, '/').replace(/^\.\//, ''); out[cur] = []; continue }
-    if (cur !== null) out[cur].push(line)
-  }
-  return Object.fromEntries(Object.entries(out).map(([k, v]) => [k, v.join('\n').trim()]))
+// The log as a page for people: examples, steps and decisions named in words, never by code.
+function buildPage(log, spec) {
+  const b = parseBuild(JSON.stringify(log), spec)
+  const parts = ['# Build log']
+  parts.push(`## Evidence for each example\n\n${b.evidence.length ? b.evidence.map(e => `- **Example ${num(e.item)}.** Before: ${oneLine(e.before)}. After: ${oneLine(e.after)}. Shown by: ${oneLine(e.how)}`).join('\n') : 'None recorded.'}`)
+  parts.push(`## Decisions made while building\n\n${b.decisions.length ? b.decisions.map((d, n) => [`### Build decision ${n + 1}: ${oneLine(d.choice)}`, d.serves && d.serves.length ? `- **Serves:** ${refs(d.serves)}` : '', ...decisionLines(d, 'Made while building.')].filter(Boolean).join('\n')).join('\n\n') : 'None.'}`)
+  parts.push(`## Deviations from the plan\n\n${b.deviations.length ? b.deviations.map(d => `- **Step ${num(d.step)}.** Planned: ${oneLine(d.planned)}. Done instead: ${oneLine(d.actual)}. Because: ${oneLine(d.because)}`).join('\n') : 'None.'}`)
+  parts.push(`## What the builder says the change does\n\nThese are the builder's own claims; the check verifies each against the change.\n\n${b.claims.length ? b.claims.map(c => `- ${oneLine(c.text)}`).join('\n') : 'None.'}`)
+  return parts.join('\n\n') + '\n'
+}
+// </lib:build>
+
+// <lib:pr> copied from src/lib/pr.js by tools/sync-lib.mjs; edit the source, not this copy
+// The pull request (architecture 8.1): a short body from the spec, the check and the build log,
+// filled into the project's template when it has one. It never repeats the review: it links to it.
+// Pure functions only. Needs the spec library (oneLine, commitSubject).
+
+// GitHub's own places for a single template, in the order GitHub looks.
+const PR_TEMPLATE_PLACES = ['.github/pull_request_template.md', 'pull_request_template.md', 'docs/pull_request_template.md']
+
+// The template among the repository's tracked files. Several templates in a PULL_REQUEST_TEMPLATE
+// folder are a choice for the author, so none is picked.
+function findTemplate(files) {
+  const lower = new Map(files.map(f => [f.trim().toLowerCase(), f.trim()]))
+  for (const p of PR_TEMPLATE_PLACES) if (lower.has(p)) return { path: lower.get(p), note: null }
+  const many = files.map(f => f.trim()).filter(f => /^(\.github\/|docs\/)?pull_request_template\/[^/]+\.md$/i.test(f))
+  if (many.length === 1) return { path: many[0], note: null }
+  return { path: null, note: many.length ? `the project has ${many.length} pull request templates; none was chosen, so RBB's own sections are used` : null }
 }
 
-const SHARED = '.claude/settings.json'
-const LOCAL = '.claude/settings.local.json'
-const TARGETS = [SHARED, LOCAL, 'none']
-
-// The skill passes an object; an agent that passes the argument text itself writes key=value words.
-function parseSetupArgs(args) {
-  if (args && typeof args === 'object') return args
-  const out = {}
-  for (const word of String(args || '').trim().split(/\s+/)) {
-    const m = /^([a-z_]+)=(.+)$/.exec(word)
-    if (m) out[m[1]] = m[2]
-  }
-  return out
+// "owner/repo" from a GitHub remote URL, or null for any other remote.
+function githubRepo(url) {
+  const m = /github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/.exec(String(url || '').trim())
+  return m ? `${m[1]}/${m[2]}` : null
 }
 
-// The questions still open after detection, in the shape the goal's questions have, so the skill
-// asks them the same way: the commit style when the history is mixed, the test command when
-// candidates were recognised. An answer given in the arguments closes its question.
-function setupQuestions(commit, tests, given) {
-  const qs = []
-  if (commit.kind === 'unclear' && !['conventional', 'plain'].includes(given.commit_style)) {
-    const { conventional, total } = commit.evidence
-    qs.push({
-      key: 'commit_style',
-      question: `Which commit style should RBB's own commits follow in this repository?`,
-      options: [
-        { option: 'conventional', means: 'subjects like "docs: approve spec for <title>"' },
-        { option: 'plain', means: 'subjects like "Approve spec for <title>"' },
-      ],
-      recommendation: commit.recommend.kind,
-      because: total < 5 ? `only ${total} recent subjects to go by, too few to tell` : `${conventional} of the last ${total} subjects follow Conventional Commits ("fix(scope): ..."), ${conventional / total >= 0.5 ? 'half or more' : 'fewer than half'}`,
-      affects: 'the subject of every commit RBB makes: the approval, the build and the records',
-    })
-  }
-  if (tests.candidates.length && given.test_command === undefined) {
-    qs.push({
-      key: 'test_command',
-      question: 'Which command runs this project\'s tests? RBB allows it, so the scout and the builder are not asked each run.',
-      options: [
-        ...tests.candidates.map(c => ({ option: c.command, means: `${c.found} is at the root; the rule allows ${c.rule}` })),
-        { option: 'none', means: 'no test command is allowed; each run asks you' },
-      ],
-      recommendation: tests.recommend,
-      because: `${tests.candidates[0].found} is at the root of the repository`,
-      affects: 'one permission rule, and nothing else',
-    })
-  }
-  return qs
+// The review at the commit that holds it: still resolves after the records are cleared.
+function reviewLink(repo, sha, change) {
+  const path = `.rbb/${change}/review.md`
+  return repo ? `https://github.com/${repo}/blob/${sha}/${path}` : path
 }
 
-// The test command settled: from the answer (their own words allowed), else from an existing config.
-function settledTest(given, tests, previous) {
-  const a = given.test_command
-  if (a === 'none') return null
-  if (a) { const c = tests.candidates.find(x => x.command === a.trim()); return c ? { command: c.command, rule: c.rule, by: 'requester' } : { command: a.trim(), rule: ruleFor(a), by: 'requester' } }
-  return previous && previous.test && previous.test.command ? { ...previous.test } : null
+// What a PR reviewer needs before opening the review: the goal; each change, with where it is;
+// the check's result with each difference and each statement to confirm as one line; and the
+// judgment calls, one line each. Headlines only: the reasons and the detail stay in the review.
+function prParts(spec, check, link) {
+  const hunks = new Map((check.hunks || []).map(h => [h.id, h]))
+  const units = check.units || []
+  const line = t => oneLine(t || '').trim().replace(/\.$/, '')
+  // Where a change is, as lines of the changed code, grouped by file.
+  const where = ids => {
+    const byFile = new Map()
+    for (const id of ids) {
+      const h = hunks.get(id)
+      if (!h) continue
+      const at = h.new_start === undefined || h.new_start === null ? '' : h.new_len === 0 ? `removed after line ${h.new_start}` : h.new_len === 1 ? `line ${h.new_start}` : `lines ${h.new_start}–${h.new_start + h.new_len - 1}`
+      if (!byFile.has(h.file)) byFile.set(h.file, [])
+      if (at) byFile.get(h.file).push(at)
+    }
+    return [...byFile].map(([f, a]) => `\`${f}\`${a.length ? ` ${a.join(', ')}` : ''}`).join('; ')
+  }
+  const changes = units.map(u => `- ${line(u.summary || 'A change')}.${u.hunks.length ? `\n  - Where: ${where(u.hunks)}` : ''}`)
+
+  // Each difference from the approved spec, as one line: what it is, and where.
+  const item = id => { const i = [...spec.done_when, ...spec.constraints, ...spec.out_of_scope].find(x => x.id === id); return i ? `"${line(i.text)}"` : 'an item of the spec' }
+  const step = id => { const p = spec.plan.steps.find(x => x.id === id); return p ? `"${line(p.does)}"` : 'a plan step' }
+  const label = e => ({
+    unrequested: e.extras && e.extras.length ? `Not asked for: ${line(typeof e.extras[0] === 'string' ? e.extras[0] : e.extras[0].text)}` : 'A change nobody asked for',
+    unexplained_deviation: 'Changed outside the plan, with no reason logged',
+    item_missing: `Example not met: ${item(e.item)}`, item_partial: `Example only partly met: ${item(e.item)}`,
+    item_contradicts: `Example contradicted: ${item(e.item)}`, item_needs_a_person: `Example the change alone cannot show: ${item(e.item)}`,
+    constraint_violated: `Constraint broken: ${item(e.item)}`, step_not_done: `Plan step not done: ${step(e.step)}`,
+    unsupported_claim: `The builder's claim is contradicted: "${line(e.claim)}"`,
+    decision_conflict: 'A build decision goes against the approved spec', spec_integrity: 'The approved spec was changed without approval',
+  }[e.kind] || e.kind)
+  const explained = ((check.plan && check.plan.unplanned_hunks) || []).filter(u => u.explained_by)
+  const differences = [
+    ...(check.exceptions || []).map(e => `- ${label(e)}${e.hunks && e.hunks.length ? ` (${where(e.hunks)})` : ''}.`),
+    ...explained.map(u => `- Changed outside the plan, with the builder's reason (${where([u.hunk])}).`),
+  ]
+  const confirm = (check.for_a_person || []).map(c => `- "${line(c.claim)}"`)
+  // Mode none has no review file to link to: the review is collapsed at the end of the body.
+  const review = link ? `[the review](${link})` : 'the review at the end'
+  const result = check.verdict === 'error'
+    ? `RBB's check of this change did not complete. See ${review}.`
+    : [
+        `RBB checked the change against its approved spec: ${differences.length ? `${differences.length} difference${differences.length === 1 ? '' : 's'}` : 'no differences'}. Each one, with its reason and the code, is in ${review}.`,
+        differences.join('\n'),
+        confirm.length ? `The builder also says the following, which the change alone cannot show; a person should confirm it:\n\n${confirm.join('\n')}` : '',
+      ].filter(Boolean).join('\n\n')
+  const calls = spec.decisions.filter(d => d.judgment !== false).map(d => `- ${line(d.choice)}.`)
+  // Defects the scout found off the path, left alone by this change: one line each, for the reviewer.
+  const followUps = (spec.follow_ups || []).map(f => `- ${line(f.text)}.`)
+  // What no example exercises: what the reviewer should know before reading, one line each.
+  const focus = (spec.review_focus || []).map(f => `- ${line(f)}.`)
+  return { goal: oneLine(spec.goal), changes: changes.join('\n') || '- No code changed.', check: result, decisions: calls.join('\n'), follow_ups: followUps.join('\n'), review_focus: focus.join('\n') }
 }
+
+function prBody(parts) {
+  return [
+    `## Goal\n\n${parts.goal}`,
+    `## What changed\n\n${parts.changes}`,
+    `## Check\n\n${parts.check}`,
+    parts.review_focus ? `## What no example exercises\n\nYou should know these before reading the change.\n\n${parts.review_focus}` : '',
+    parts.decisions ? `## Decisions worth a look\n\nJudgment calls made while planning; why each was made, and the alternatives, are in the review.\n\n${parts.decisions}` : '',
+    parts.follow_ups ? `## Found along the way, not part of this change\n\n${parts.follow_ups}` : '',
+  ].filter(Boolean).join('\n\n') + '\n'
+}
+
+// Who drafted it, for a template that asks: the tool, and the models that made the decisions, with
+// their effort, from the stamps in the spec and the build log (section 5.1.2).
+function prFacts(spec, log) {
+  const roles = new Map()
+  const add = (w, role) => {
+    if (!w || w.by !== 'model' || !w.model) return
+    const key = `${w.model}${w.effort ? ` at ${w.effort} effort` : ''}`
+    if (!roles.has(key)) roles.set(key, [])
+    if (!roles.get(key).includes(role)) roles.get(key).push(role)
+  }
+  for (const d of spec.decisions || []) { add(d.decided_by, 'planning'); if (d.alternatives_reviewed_by) add({ by: 'model', ...d.alternatives_reviewed_by }, 'reviewing alternatives') }
+  for (const e of (log && log.entries) || []) if (e.kind === 'decision' || e.kind === 'deviation') { add(e.decided_by, 'building'); if (e.alternatives_reviewed_by) add({ by: 'model', ...e.alternatives_reviewed_by }, 'reviewing alternatives') }
+  const models = [...roles].map(([m, r]) => `${m} (${r.join(', ')})`).join('; ')
+  return { tool: 'RBB (Record Before Build), a Claude Code plugin', models: models || 'not recorded', notes: 'Built from a spec the requester approved; the review linked above checks the change against it.' }
+}
+
+const SUMMARY_HEADING = /summary|description|what|changes?\b|overview|motivation|context|why|purpose/i
+const AGENT_HEADING = /\bagents?\b|\bai\b|\bllm\b|\bmodels?\b|assist|automat|generat|drafting/i
+
+// The template, its parts kept: preamble, headings, comments and checklists. The summary goes into
+// the first summary section, or a new one at the end; an AI-assistance section has its empty
+// "Label:" lines filled from the record. Checkboxes are never ticked.
+function fillTemplate(text, parts, facts) {
+  const lines = String(text).replace(/\r\n/g, '\n').split('\n')
+  const sections = [{ heading: null, lines: [] }]
+  for (const l of lines) {
+    if (/^#{1,6}\s/.test(l)) sections.push({ heading: l, lines: [] })
+    else sections[sections.length - 1].lines.push(l)
+  }
+  const summary = [parts.goal, `**What changed**\n\n${parts.changes}`, `**Check**\n\n${parts.check}`, parts.decisions ? `**Decisions worth a look** (why, and the alternatives, are in the review)\n\n${parts.decisions}` : ''].filter(Boolean).join('\n\n')
+  const isSummary = s => s.heading && SUMMARY_HEADING.test(s.heading) && !AGENT_HEADING.test(s.heading)
+  const target = sections.find(isSummary)
+  const fill = l => {
+    const m = /^(\s*(?:[-*]\s+)?)([A-Za-z][A-Za-z /()-]*?):\s*$/.exec(l)
+    if (!m) return l
+    const label = m[2].toLowerCase()
+    const value = /model/.test(label) ? facts.models : /agent|tool|assistant/.test(label) ? facts.tool : /note/.test(label) ? facts.notes : null
+    return value ? `${m[1]}${m[2]}: ${value}` : l
+  }
+  const out = sections.map(s => {
+    let body = s.lines
+    if (s.heading && AGENT_HEADING.test(s.heading)) body = body.map(fill)
+    if (s === target) {
+      const kept = body.join('\n').trim()
+      return [s.heading, '', ...(kept ? [kept, ''] : []), summary, ''].join('\n')
+    }
+    return [...(s.heading ? [s.heading] : []), ...body].join('\n')
+  })
+  let result = out.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+  if (!target) result += `\n\n## Summary\n\n${summary}`
+  return result + '\n'
+}
+
+// Mode none (architecture 9.1): the review itself, collapsed, and the approved spec's hash, which is
+// the only evidence in the repository that the spec was not changed after approval. With no review
+// text (the agent saving the body was refused for copying it), the body says where the review is.
+function noneAppendix(reviewText, hashes, reviewPath) {
+  const ids = Object.entries(hashes).map(([f, h]) => `- \`${f}\`: \`${h}\``).join('\n')
+  const review = reviewText
+    ? `<details>\n<summary>The full review</summary>\n\n${String(reviewText).trim()}\n\n</details>`
+    : `The full review is not in this body: the agent saving the body was not allowed to copy it. The requester holds it on their machine as \`${reviewPath || 'review.md'}\`.`
+  return `\n${review}\n\nThe approved spec's files, by git blob id:\n\n${ids}\n\nThis repository keeps no RBB files, so these ids, kept by the requester, are the only evidence that the spec was not changed after approval.\n`
+}
+
+// The PR title: the spec's title, safe to pass as a quoted argument.
+function prTitle(spec) {
+  return String(spec.title || spec.change).replace(/["'`$\\]/g, '').replace(/\s+/g, ' ').trim()
+}
+
+// The commit that holds the check and the review, in the project's commit style.
+function recordsSubject(spec, style) {
+  const prefix = style && style.kind === 'conventional' ? `${style.type || 'docs'}${style.scope ? `(${style.scope})` : ''}: record the check of ` : 'Record the check: '
+  return commitSubject(prefix, spec.title || spec.change)
+}
+
+function recordsCommands(change, subject) {
+  const files = `.rbb/${change}/check.json .rbb/${change}/review.md`
+  return [`git add -- ${files}`, `git commit -m "${subject}" -- ${files}`]
+}
+// </lib:pr>
+
+const READBACK_SCHEMA_PR = { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] }
+// refused separates a command that was never allowed to run from one that printed nothing.
+const RELAY_PR = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, { type: 'string', description: `stdout of the command labelled ${k}, verbatim` }])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run; empty if all ran' } }, required: [...keys, 'refused'] })
+const DEFAULT_BRANCH = /^(main|master|develop|trunk)$/
 
 // </pure>
 
@@ -844,86 +932,140 @@ async function recordPage(path, full, reduced, phase) {
 }
 // </lib:record>
 
-const given = parseSetupArgs(args)
-const documents = given.documents === 'none' ? 'none' : given.documents === 'committed' ? 'committed' : undefined
-if (given.permissions !== undefined && !TARGETS.includes(given.permissions)) return { error: `permissions must be one of ${TARGETS.join(', ')}` }
+// The skill passes {"change": ...}; an agent that passes the argument text itself means its first word.
+const change = typeof args === 'string' ? args.trim().split(/\s+/)[0] : args && args.change
+if (!change || !/^[a-z0-9][a-z0-9-]*$/.test(change)) return { error: 'rbb:write-pr needs a change name' }
+const dir = `.rbb/${change}`
 
-const RELAY = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, { type: 'string', description: `stdout of the command labelled ${k}, verbatim` }])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run; empty if all ran' } }, required: [...keys, 'refused'] })
-const cmds = [
-  ['log', 'git log -50 --format=%s'],
-  ['branches', "git branch -a --format='%(refname:short)'"],
-  ['root', 'git ls-tree --name-only HEAD'],
-  ['files', `tail -v -n +1 .rbb/config.json .rbb/.gitignore ${SHARED} ${LOCAL}`],
-  ['make', "grep -n '^test:' Makefile"],
-  ['ignored', `git check-ignore ${LOCAL}`],
-]
-const keys = cmds.map(([k]) => k)
-const prompt = `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label: every character and newline, nothing added, removed or summarised. Return a command's standard output even when it also reports an error, such as one missing file among several: an empty string only when it printed nothing to standard output. If you were not allowed to run a command, return an empty string and list its label under refused.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
-
-phase('Detect')
-const [a, b] = await parallel([1, 2].map(i => () => agent(prompt, { label: `repository ${i}`, phase: 'Detect', agentType: 'rbb:checker', effort: 'low', schema: RELAY(keys) })))
-if (!a || !b) return { error: 'a relay of the repository failed' }
-const refused = [...new Set([...(a.refused || []), ...(b.refused || [])])]
-if (refused.length) return { error: `not allowed to run: ${refused.map(k => cmds.find(([x]) => x === k)[1]).join('; ')}` }
-const differ = keys.filter(k => String(a[k] || '').trim() !== String(b[k] || '').trim())
-if (differ.length) return { error: `the two relays of the repository disagreed on: ${differ.join(', ')}` }
-
-const files = splitTail(a.files)
-let previous = null
-try { previous = files['.rbb/config.json'] ? JSON.parse(files['.rbb/config.json']) : null } catch (e) { previous = null }
-const mode = documents || documentsMode(previous)
-const commit = detectCommitStyle(a.log.split('\n'))
-const branch = detectBranchStyle(a.branches.split('\n'))
-const tests = detectTestCommand(a.root, a.make)
-const questions = setupQuestions(commit, tests, given)
-const test = questions.some(q => q.key === 'test_command') ? null : settledTest(given, tests, previous)
-const rules = permissionRules(test && test.rule)
-
-// Where the rules go: the argument, else what an earlier setup chose, else nowhere until asked.
-const target = given.permissions !== undefined ? given.permissions : previous && previous.permissions && previous.permissions.file ? previous.permissions.file : 'none'
-const other = target === SHARED ? LOCAL : SHARED
-
-// Claude Code asks the requester before any agent writes one of its settings files, whatever the
-// permission mode, and a declined write is the likely failure: the recorder reports it, once.
-const WRITE_SCHEMA = { type: 'object', properties: { written: { type: 'boolean', description: 'true when the Write tool reported success' }, refusal: { type: 'string', description: "the tool's error text, verbatim, when the write was refused or needed a permission that was not granted; empty otherwise" } }, required: ['written', 'refusal'] }
-async function writeSettings(path, text, settings) {
-  const wrote = await agent(`Write this content to ${path}. If the Write tool is refused, or asks for a permission that is not granted, do not try again or in another way: report it.\n\n${text}`, { label: `write ${path}`, phase: 'Record', agentType: 'rbb:recorder', effort: 'low', schema: WRITE_SCHEMA })
-  if (!wrote) return `the agent writing ${path} ended with an error; not retried`
-  if (!wrote.written) return `Claude Code did not allow the write of ${path}${wrote.refusal ? ` (${oneLine(wrote.refusal)})` : ''}`
-  const back = await agent(`Read the file ${path} and return its content verbatim, without line numbers.`, { label: `read back ${path}`, phase: 'Record', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })
-  try { if (back && JSON.stringify(JSON.parse(back.content)) === JSON.stringify(settings)) return null } catch (e) { /* not the content written */ }
-  return `${path} could not be read back as written`
-}
-
-phase('Record')
-let permissions = { file: null }
-if (target !== 'none') {
-  const merged = mergeAllow(files[target] || '', rules, allowList(files[other] || ''))
-  if (merged.error) permissions = { file: target, error: `${target} ${merged.error}` }
-  else if (!merged.added.length) permissions = { file: target, added: [] }
-  else {
-    const problem = await writeSettings(target, merged.text, merged.settings)
-    permissions = problem ? { file: target, error: problem } : { file: target, added: merged.added }
+async function relay(label, cmds) {
+  const keys = cmds.map(([k]) => k)
+  const prompt = `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label. If a command prints nothing, or fails, return an empty string for it. If you were not allowed to run a command, return an empty string and list its label under refused.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
+  // Nothing to run: nothing to relay, and no schema with an empty enum, which the host rejects.
+  if (!cmds.length) return { out: {} }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const [a, b] = await parallel([1, 2].map(i => () => agent(prompt, { label: `${label} ${attempt}.${i}`, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: RELAY_PR(keys) })))
+    const refused = [...new Set([...((a && a.refused) || []), ...((b && b.refused) || [])])]
+    if (refused.length) return { refused: refused.map(k => cmds.find(([l]) => l === k)[1]) }
+    if (a && b && keys.every(k => String(a[k]).trim() === String(b[k]).trim())) return { out: Object.fromEntries(keys.map(k => [k, String(a[k]).replace(/\s+$/, '')])) }
   }
-  if (target === LOCAL) permissions.ignored = String(a.ignored || '').trim() !== ''
+  return null
 }
-const shown = permissions.file === null || permissions.error ? rules : undefined
+const refusedError = r => ({ change, error: `these read-only commands were not allowed to run; allow them and try again: ${r.refused.join(' ; ')}` })
 
-if (questions.length) return { questions, permissions, ...(shown ? { rules: shown } : {}), detected: { commit, branch, tests } }
-
-// Mode none: written first, so config.json itself is never seen by git.
-if (mode === 'none' && files['.rbb/.gitignore'] === undefined) {
-  const ignored = await recordFile('.rbb/.gitignore', NONE_GITIGNORE, 'Record')
-  if (ignored !== true) return { error: '.rbb/.gitignore could not be saved and verified, so RBB wrote no config', permissions }
+phase('Facts')
+const f = await relay('facts', [
+  ['head', 'git rev-parse HEAD'],
+  ['branch', 'git branch --show-current'],
+  ['remote', 'git remote get-url origin'],
+  ['status', `git status --porcelain=v1 -uall -- . ':(exclude).rbb'`],
+  ['records', `git status --porcelain=v1 -uall -- ${dir}/check.json ${dir}/review.md`],
+  ['files', 'git -c core.quotepath=false ls-files'],
+  ...SPEC_FILES.map((name, n) => [`s${n}`, `git show HEAD:${dir}/${name}`]),
+  ['build', `git show HEAD:${dir}/build.json`],
+  ['build_meta', `git show HEAD:${dir}/build-meta.json`],
+])
+if (f && f.refused) return refusedError(f)
+if (!f || !/^[0-9a-f]{40}$/.test(f.out.head)) return { change, error: 'the two relays of git facts disagreed or failed' }
+if (f.out.status) return { change, error: 'the working tree has uncommitted changes outside .rbb, which the check does not cover; commit them and run the check again', status: f.out.status }
+// Documents mode (architecture 9.1): in mode none the records are local files, and the spec must
+// have the hash it was approved with.
+const readFile = async (file, label) => { const b = await agent(`Read the file ${file} and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA_PR }); return b ? b.content : '' }
+const parse = t => { try { return t && t.trim() ? JSON.parse(t) : null } catch (e) { return null } }
+const config = parse(await readFile('.rbb/config.json', 'read config'))
+const none = documentsMode(config) === 'none'
+// The spec is rebuilt in memory from its manifest and the files it names (architecture 5.2.1).
+let texts = null, log = null, approval = null
+if (none) {
+  approval = parse(await readFile(`${dir}/approval.json`, 'read approval'))
+  if (approvalProblems(approval, change).length) return { change, error: `no valid approval for ${change}; approve the spec first` }
+  // The files the approval froze are hashed again: the manifest at approval time names them.
+  const hashed = await relay('spec hashes', [['hashes', `git hash-object ${hashedFiles(approval).map(name => `${dir}/${name}`).join(' ')}`]])
+  if (hashed && hashed.refused) return refusedError(hashed)
+  if (!hashed) return { change, error: 'the two relays of the spec hashes disagreed or failed' }
+  const changed = changedSpecFiles(approval, hashed.out.hashes)
+  if (changed.length) return { change, error: `the spec changed after it was approved (${changed.join(', ')}); approve it again` }
+  const read = await parallel(SPEC_FILES.map(name => () => readFile(`${dir}/${name}`, `read ${name}`)))
+  texts = Object.fromEntries(SPEC_FILES.map((name, n) => [name, read[n]]))
+  log = parse(buildLogText(await readFile(`${dir}/build.json`, 'read build log'), await readFile(`${dir}/build-meta.json`, 'read build meta')))
+} else {
+  texts = Object.fromEntries(SPEC_FILES.map((name, n) => [name, f.out[`s${n}`]]))
+  log = parse(buildLogText(f.out.build, f.out.build_meta))
 }
-const style = commit.kind !== 'unclear' ? commit : { ...commit, kind: given.commit_style, type: given.commit_style === 'conventional' ? (commit.recommend.type || 'docs') : undefined }
-const by = commit.kind !== 'unclear' ? 'detected' : 'requester'
-// The config says where the rules went and whether they got there; the error itself names a path on
-// this machine and stays in the result, since config.json may be committed.
-const config = toConfig(style, branch, by, mode, test, { file: permissions.file, written: permissions.file !== null && !permissions.error })
-const recorded = await recordFile('.rbb/config.json', JSON.stringify(config, null, 2) + '\n', 'Record', t => { try { return JSON.stringify(JSON.parse(t)) === JSON.stringify(config) } catch (e) { return false } })
-if (recorded !== true) return { error: '.rbb/config.json could not be saved and verified', permissions }
-// Nothing is deleted by a step that was not asked to delete: a repository moved from mode none to
-// committed keeps the .gitignore that hides its records until the requester removes it.
-const note = mode === 'committed' && files['.rbb/.gitignore'] !== undefined ? '.rbb/.gitignore, left by documents mode none, still keeps every RBB file out of git: remove it so that the records can be committed' : undefined
-return { config, documents: mode, permissions, ...(shown ? { rules: shown } : {}), ...(note ? { note } : {}) }
+const built = specFromTexts(change, texts)
+const spec = built.spec || null
+if (!spec || validateSpec(spec, change).length) return { change, error: `the spec is not committed at HEAD, or does not meet its format${built.error ? ` (${built.error})` : ''}; approve the spec first` }
+
+const back = await agent(`Read the file ${dir}/check.json and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label: 'read check', phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA_PR })
+let check = null
+try { check = back && back.content.trim() ? JSON.parse(back.content) : null } catch (e) { check = null }
+if (!check) return { change, error: `${dir}/check.json is missing or not JSON; run /rbb:check first` }
+if (check.verdict === 'error') return { change, error: `the last check did not complete (${check.error ? check.error.reason : 'unknown reason'}); run /rbb:check again` }
+if (!/^[0-9a-f]{40}$/.test(check.head || '')) return { change, error: 'the check does not record the commit it checked; run /rbb:check again' }
+
+// Covered: the code at the checked commit is the code at HEAD. Commits since then may only touch .rbb.
+const cov = await relay('covered', [
+  ['kind', `git cat-file -t ${check.head}`],
+  ['changed', `git -c core.quotepath=false diff --name-only ${check.head} HEAD -- . ':(exclude).rbb'`],
+  ['review', `git ls-files --others --cached -- ${dir}/review.md`],
+])
+if (cov && cov.refused) return refusedError(cov)
+if (!cov || cov.out.kind !== 'commit') return { change, error: `the checked commit ${check.head.slice(0, 10)} is not in this repository; run /rbb:check again` }
+if (cov.out.changed) return { change, error: 'the code changed after the check; run /rbb:check again', changed: cov.out.changed.split('\n') }
+const reviewText = none ? await readFile(`${dir}/review.md`, 'read review') : null
+if (none ? !reviewText.trim() : !cov.out.review) return { change, error: `${dir}/review.md is missing; run /rbb:check again` }
+
+phase('Commit')
+// In mode none nothing is committed. Otherwise the check and the review are, in the project's style.
+let committed = null, sha = null
+if (!none && f.out.records) {
+  const subject = recordsSubject(spec, config && config.commit)
+  const cmds = recordsCommands(change, subject)
+  await agent(`Run these commands:\n${cmds.map((c, n) => `${n + 1}. ${c}`).join('\n')}`, { label: 'commit records', phase: 'Commit', agentType: 'rbb:committer', effort: 'low' })
+  committed = subject
+}
+// Verified from git, not from the committer's report: the records are committed and unchanged.
+if (!none) {
+  const v = await relay('verify', [
+    ['records', `git status --porcelain=v1 -uall -- ${dir}/check.json ${dir}/review.md`],
+    ['sha', `git log -1 --format=%H -- ${dir}/review.md`],
+  ])
+  if (v && v.refused) return refusedError(v)
+  if (!v || v.out.records || !/^[0-9a-f]{40}$/.test(v.out.sha)) return { change, error: 'the check and the review could not be committed; check git status' }
+  sha = v.out.sha
+}
+
+phase('Body')
+const repo = githubRepo(f.out.remote)
+const parts = prParts(spec, check, none ? null : reviewLink(repo, sha, change))
+const tpl = findTemplate(f.out.files.split('\n').filter(Boolean))
+let body = prBody(parts)
+if (tpl.path) {
+  const t = await relay('template', [['text', `git show HEAD:${tpl.path}`]])
+  if (t && t.refused) return refusedError(t)
+  if (t && t.out.text.trim()) body = fillTemplate(t.out.text, parts, prFacts(spec, log))
+}
+// In mode none the body carries the review; when saving that is refused, the body without it is
+// saved instead and says where the review is (architecture 5.2.1).
+const reduced = none ? body + noneAppendix(null, approval.hashes, `${dir}/review.md`) : null
+if (none) body += noneAppendix(reviewText, approval.hashes)
+const recorded = await recordPage(`${dir}/pr.md`, body, reduced, 'Body')
+if (!recorded) return { change, error: `${dir}/pr.md could not be saved and verified` }
+
+const branch = f.out.branch
+const style = config && config.branch
+return {
+  change,
+  body: `${dir}/pr.md`,
+  body_complete: recorded === 'full',
+  title: prTitle(spec),
+  documents: none ? 'none' : 'committed',
+  records_commit: sha,
+  records_committed_now: committed,
+  template: tpl.path,
+  template_note: tpl.note,
+  github: repo,
+  branch: branch || null,
+  // On a default branch, a pull request needs a branch of its own, named by the project's convention.
+  needs_branch: !branch || DEFAULT_BRANCH.test(branch),
+  suggested_branch: style && style.kind === 'prefix' && style.prefix ? `${style.prefix}${change}` : change,
+}

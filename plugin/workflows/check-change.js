@@ -1,11 +1,11 @@
 export const meta = {
-  name: 'pr',
-  description: 'RBB: commit the check and the review, and write the pull request body as .rbb/<change>/pr.md, filled into the project template. Posts nothing.',
-  whenToUse: 'Started by the /rbb:pr skill after a check; not for direct use.',
+  name: 'check-change',
+  description: 'RBB: check a change against its approved spec and plan, with agents that never see the builder\'s conversation, and record the result',
+  whenToUse: 'Started by the rbb:check skill; not for direct use.',
   phases: [
-    { title: 'Facts', detail: 'git facts relayed twice; the check must cover the current code' },
-    { title: 'Commit', detail: 'check.json and review.md committed and verified from git' },
-    { title: 'Body', detail: 'the short body written by code into the project template, saved and read back' },
+    { title: 'Facts', detail: 'git output relayed twice, verified, parsed by code' },
+    { title: 'Judge', detail: 'grouping, plan adherence, spec mapping, then claims last' },
+    { title: 'Record', detail: 'check.json written and read back' },
   ],
 }
 
@@ -595,6 +595,312 @@ function commitSubject(prefix, title) {
 }
 // </lib:spec>
 
+// Relayed stdout in canonical form: trailing newlines removed. Agents differ on whether they
+// keep the final "\n" that terminates a command's output; it carries no meaning, and every
+// parser below is indifferent to it. Everything else must match exactly.
+function canon(s) {
+  return String(s).replace(/\n+$/, '')
+}
+
+function parseArgs(a) {
+  if (typeof a === 'string') {
+    const [change, mode] = a.trim().split(/\s+/)
+    return { change, mode: mode || 'grouped' }
+  }
+  return { change: a && a.change, mode: (a && a.mode) || 'grouped' }
+}
+
+// git diff --numstat: "<added>\t<deleted>\t<path>"; binary files show "-\t-".
+function parseNumstat(text) {
+  const files = []
+  for (const line of text.split('\n')) {
+    if (!line) continue
+    const m = /^(-|\d+)\t(-|\d+)\t(.+)$/.exec(line)
+    if (!m) throw new Error(`numstat: unexpected line: ${line}`)
+    const binary = m[1] === '-'
+    files.push({ path: gitPath(m[3]), binary, added: binary ? null : +m[1], deleted: binary ? null : +m[2] })
+  }
+  return files
+}
+
+// A path as git prints it in a diff header or numstat. Git ends a ---/+++ path that contains a
+// space with a tab, and C-quotes a path with special characters ("a/x\"y", octal bytes for
+// UTF-8 when core.quotepath is on). Returns the path unquoted, without any trailing tab.
+function gitPath(raw) {
+  let s = raw.endsWith('\t') ? raw.slice(0, -1) : raw
+  if (!(s.length >= 2 && s.startsWith('"') && s.endsWith('"'))) return s
+  s = s.slice(1, -1)
+  const esc = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 }
+  const hex = b => '%' + b.toString(16).padStart(2, '0')
+  let out = ''
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (c !== '\\') { out += encodeURIComponent(c); continue }
+    const n = s[i + 1]
+    if (/[0-7]/.test(n)) { out += hex(parseInt(s.slice(i + 1, i + 4), 8)); i += 3 }
+    else if (n in esc) { out += hex(esc[n]); i += 1 }
+    else throw new Error(`path: unknown escape \\${n} in ${raw}`)
+  }
+  return decodeURIComponent(out)
+}
+
+// A ---/+++ header path: null for /dev/null, else the path without its a/ or b/ prefix.
+function headerPath(rest) {
+  if (rest === '/dev/null') return null
+  const p = gitPath(rest)
+  return p.startsWith('a/') || p.startsWith('b/') ? p.slice(2) : p
+}
+
+// git diff -U0 with --no-renames. Hunk header: @@ -a[,b] +c[,d] @@ ; an omitted length means 1.
+function parseDiff(text) {
+  const files = []
+  let cur = null
+  const lines = text.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.startsWith('diff --git ')) {
+      cur = { path: null, oldPath: null, newPath: null, newFile: false, deleted: false, binary: false, modeChange: false, modeOnly: false, emptyFile: false, hunks: [] }
+      files.push(cur)
+      continue
+    }
+    if (!cur) continue
+    if (line.startsWith('new file mode')) cur.newFile = true
+    else if (line.startsWith('deleted file mode')) cur.deleted = true
+    else if (line.startsWith('old mode ') || line.startsWith('new mode ')) cur.modeChange = true
+    else if (line.startsWith('Binary files ')) cur.binary = true
+    else if (line.startsWith('--- ')) cur.oldPath = headerPath(line.slice(4))
+    else if (line.startsWith('+++ ')) cur.newPath = headerPath(line.slice(4))
+    else if (line.startsWith('@@ ')) {
+      const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line)
+      if (!m) throw new Error(`diff: bad hunk header: ${line}`)
+      const hunk = {
+        oldStart: +m[1], oldLen: m[2] === undefined ? 1 : +m[2],
+        newStart: +m[3], newLen: m[4] === undefined ? 1 : +m[4],
+        header: line,
+        body: [],
+      }
+      // With -U0 a hunk holds exactly oldLen '-' lines and newLen '+' lines (plus any
+      // '\ No newline' markers). Read by count, never by guessing where a header starts:
+      // a removed line whose content is '-- x' appears as '--- x'.
+      let del = 0, add = 0, j = i + 1
+      while (j < lines.length && (del < hunk.oldLen || add < hunk.newLen || (lines[j] || '').startsWith('\\'))) {
+        const l = lines[j]
+        if (l.startsWith('-') && del < hunk.oldLen) del++
+        else if (l.startsWith('+') && add < hunk.newLen) add++
+        else if (!l.startsWith('\\')) throw new Error(`diff: hunk ${line} ends early at: ${l}`)
+        hunk.body.push(l); j++
+      }
+      // A body cut off at the end of the text (a truncated relay) must not pass as a whole hunk.
+      if (del < hunk.oldLen || add < hunk.newLen) throw new Error(`diff: hunk ${line} is cut off: ${del} of ${hunk.oldLen} removed and ${add} of ${hunk.newLen} added lines present`)
+      i = j - 1
+      cur.hunks.push(hunk)
+    }
+  }
+  for (const f of files) {
+    f.path = f.newPath || f.oldPath
+  }
+  return files
+}
+
+// Fill in paths for binary and mode-only entries from numstat, and cross-check the rest.
+function crossCheck(diffFiles, numstat) {
+  const problems = []
+  const byPath = new Map(numstat.map(n => [n.path, n]))
+  const pathless = diffFiles.filter(f => !f.path)
+  const withPath = new Set(diffFiles.filter(f => f.path).map(f => f.path))
+  const unmatched = numstat.filter(n => !withPath.has(n.path))
+  if (pathless.length !== unmatched.length) problems.push(`files: ${pathless.length} diff entries without a path, ${unmatched.length} numstat entries unmatched`)
+  pathless.forEach((f, k) => { if (unmatched[k]) { f.path = unmatched[k].path; f.binary = f.binary || unmatched[k].binary } })
+  // A file with no hunks is binary, a mode change, or an empty file created or deleted.
+  for (const f of diffFiles) if (f.hunks.length === 0 && !f.binary) { f.modeOnly = f.modeChange && !f.newFile && !f.deleted; f.emptyFile = !f.modeOnly }
+  for (const f of diffFiles) {
+    const n = byPath.get(f.path)
+    if (!n) { problems.push(`${f.path}: in the diff but not in numstat`); continue }
+    if (n.binary || f.binary) { f.binary = true; continue }
+    const added = f.hunks.reduce((s, h) => s + h.newLen, 0)
+    const deleted = f.hunks.reduce((s, h) => s + h.oldLen, 0)
+    if (added !== n.added || deleted !== n.deleted) problems.push(`${f.path}: hunks add ${added} and delete ${deleted}, numstat says ${n.added} and ${n.deleted}`)
+    for (let k = 1; k < f.hunks.length; k++) {
+      const p = f.hunks[k - 1], h = f.hunks[k]
+      const pEnd = p.oldLen === 0 ? p.oldStart : p.oldStart + p.oldLen - 1
+      if (h.oldStart <= pEnd) problems.push(`${f.path}: hunks out of order or overlapping at ${h.header}`)
+    }
+  }
+  for (const n of numstat) if (!diffFiles.some(f => f.path === n.path)) problems.push(`${n.path}: in numstat but not in the diff`)
+  return problems
+}
+
+// Hunk base range vs planned range [s,e]. A pure insertion after base line a is inside when s-1 <= a <= e.
+function hunkInRange(h, r) {
+  if (h.oldLen === 0) return r.start - 1 <= h.oldStart && h.oldStart <= r.end
+  const end = h.oldStart + h.oldLen - 1
+  return h.oldStart <= r.end && end >= r.start
+}
+
+function planFacts(spec, diffFiles) {
+  const hunks = []
+  for (const f of diffFiles) {
+    if (f.hunks.length === 0) hunks.push({ id: null, file: f.path, whole: true, binary: f.binary, modeOnly: f.modeOnly, emptyFile: f.emptyFile, newFile: f.newFile, deleted: f.deleted })
+    for (const h of f.hunks) hunks.push({ id: null, file: f.path, whole: false, newFile: f.newFile, deleted: f.deleted, ...h })
+  }
+  hunks.forEach((h, n) => { h.id = `H${n + 1}` })
+  const locs = []
+  for (const s of spec.plan.steps) s.locations.forEach((l, k) => locs.push({ step: s.id, index: k, ...l }))
+  const covers = (l, h) => {
+    if (l.file !== h.file) return false
+    if (l.change === 'new file') return !!h.newFile
+    if (l.change === 'delete' && h.deleted) return true
+    if (h.whole) return l.change === 'edit' || l.change === 'delete'
+    return !!l.lines && hunkInRange(h, l.lines)
+  }
+  const trace = locs.map(l => ({ step: l.step, file: l.file, lines: l.lines || null, symbol: l.symbol || null, change: l.change, hunks: hunks.filter(h => covers(l, h)).map(h => h.id) }))
+  const planned = new Set(locs.map(l => l.file))
+  const unplannedFiles = [...new Set(hunks.map(h => h.file))].filter(f => !planned.has(f))
+  const unplannedHunks = hunks.filter(h => !locs.some(l => covers(l, h))).map(h => h.id)
+  return { hunks, trace, unplannedFiles, unplannedHunks }
+}
+
+// The first lines a hunk adds (or, for a pure removal, removes), shortened: what the review shows.
+function hunkPreview(h) {
+  if (h.whole || !h.body) return null
+  const added = h.body.filter(l => l.startsWith('+')).map(l => l.slice(1).trim()).filter(Boolean)
+  const lines = added.length ? added : h.body.filter(l => l.startsWith('-')).map(l => l.slice(1).trim()).filter(Boolean)
+  if (!lines.length) return null
+  const shown = lines.slice(0, 2).map(l => (l.length > 80 ? `${l.slice(0, 77)}...` : l)).join(' / ')
+  return `${added.length ? 'Adds' : 'Removes'}: ${shown}${lines.length > 2 ? ` (and ${lines.length - 2} more line${lines.length - 2 === 1 ? '' : 's'})` : ''}`
+}
+
+function hunkLabel(h) {
+  if (h.whole) return `${h.file} (${h.binary ? 'binary' : h.modeOnly ? 'mode only' : 'empty file'})`
+  const span = h.oldLen === 0 ? `insert after ${h.oldStart}` : `${h.oldStart}-${h.oldStart + h.oldLen - 1}`
+  return `${h.file}:${span}`
+}
+
+// The diff as the judging agents see it: every hunk labelled with its ID and base range.
+function annotate(hunks) {
+  return hunks.map(h => h.whole
+    ? `### ${h.id} ${hunkLabel(h)}`
+    : `### ${h.id} ${hunkLabel(h)}\n${h.header}\n${h.body.join('\n')}`).join('\n\n')
+}
+
+function checkUnits(units, hunkIds) {
+  const seen = new Map()
+  for (const u of units) for (const h of u.hunks) seen.set(h, (seen.get(h) || 0) + 1)
+  const problems = []
+  const ids = units.map(u => u.id)
+  for (const id of new Set(ids.filter((x, n) => ids.indexOf(x) !== n))) problems.push(`${id}: more than one unit has this id`)
+  for (const h of hunkIds) if (!seen.has(h)) problems.push(`${h}: in no unit`)
+  for (const [h, n] of seen) {
+    if (!hunkIds.includes(h)) problems.push(`${h}: not a hunk`)
+    else if (n > 1) problems.push(`${h}: in ${n} units`)
+  }
+  return problems
+}
+
+// Each judging agent must answer for every id it was given, once, and invent none.
+function sameIds(label, want, got) {
+  const w = [...want].sort().join(','), g = [...got].sort().join(',')
+  return w === g ? [] : [`${label}: expected [${w}], got [${g}]`]
+}
+function adherenceCoverage(spec, adherence) {
+  return sameIds('plan steps', spec.plan.steps.map(s => s.id), adherence.steps.map(s => s.id))
+}
+function mappingCoverage(spec, units, mapping) {
+  const problems = [
+    ...sameIds('done-when items', spec.done_when.map(i => i.id), mapping.items.map(i => i.id)),
+    ...sameIds('constraints', spec.constraints.map(i => i.id), mapping.constraints.map(i => i.id)),
+    ...sameIds('units', units.map(u => u.id), mapping.units.map(u => u.unit)),
+  ]
+  // The mapping answers twice, from the item's side and from the unit's; both must agree.
+  const serves = new Map(mapping.units.map(u => [u.unit, new Set(u.serves)]))
+  for (const i of mapping.items) {
+    for (const u of i.units) if (!(serves.get(u) || new Set()).has(i.id)) problems.push(`${i.id} lists ${u}, but ${u} does not list ${i.id} among what it serves`)
+    for (const [u, s] of serves) if (s.has(i.id) && !i.units.includes(u)) problems.push(`${u} serves ${i.id}, but ${i.id} does not list ${u}`)
+  }
+  return problems
+}
+function coverageProblems(spec, units, adherence, mapping) {
+  return [...adherenceCoverage(spec, adherence), ...mappingCoverage(spec, units, mapping)]
+}
+
+function assemble(x) {
+  const exceptions = []
+  const unitServes = new Map(x.mapping.units.map(u => [u.unit, u.serves]))
+  // In scope: what the goal asks (examples, constraints), what the requester agreed to (agreed
+  // extras), and what an approved decision calls for (decisions). The plan's wording is not.
+  const required = new Set([...x.spec.done_when.map(i => i.id), ...x.spec.constraints.map(i => i.id), ...(x.spec.agreed_extras || []).map(i => i.id), ...x.spec.decisions.map(d => d.id)])
+  const agreedIds = new Set((x.spec.agreed_extras || []).map(i => i.id))
+  const outOfScope = new Set(x.spec.out_of_scope.map(i => i.id))
+  const unrequested = x.units.filter(u => {
+    const s = unitServes.get(u.id) || []
+    return !s.some(id => required.has(id)) || s.some(id => outOfScope.has(id))
+  }).map(u => u.id)
+  for (const t of x.unapproved) exceptions.push({ kind: 'spec_integrity', detail: `commit ${t.sha} changed the spec without approval${t.trailer ? ` (trailer: ${t.trailer})` : ''}` })
+  for (const u of unrequested) exceptions.push({ kind: 'unrequested', unit: u, hunks: x.units.find(v => v.id === u).hunks })
+  // A unit can serve an item and also carry changes no item needs (a rename or tidy-up
+  // interleaved with the fix). Those extras are unrequested too, whatever the unit's label.
+  // Each is reported on its own, at its own hunks (only the unit's; all of them if none named).
+  const unitExtras = new Map(x.mapping.units.map(u => [u.unit, u.extras || []]))
+  for (const u of x.units) {
+    if (unrequested.includes(u.id)) continue
+    for (const ex of unitExtras.get(u.id) || []) {
+      const own = (ex.hunks || []).filter(h => u.hunks.includes(h))
+      exceptions.push({ kind: 'unrequested', unit: u.id, hunks: own.length ? own : u.hunks, extras: [ex.text], near: ex.near || null })
+    }
+  }
+  for (const i of x.mapping.items) if (i.status !== 'done') exceptions.push({ kind: 'item_' + i.status, item: i.id })
+  for (const c of x.mapping.constraints) if (c.status !== 'held') exceptions.push({ kind: 'constraint_violated', item: c.id })
+  for (const s of x.adherence.steps) if (s.status === 'not_done') exceptions.push({ kind: 'step_not_done', step: s.id })
+  const explained = new Map(x.claims.deviations.map(d => [d.hunk, d.explained_by]))
+  const unplanned = x.plan.unplannedHunks.map(h => ({ hunk: h, label: hunkLabel(x.plan.hunks.find(k => k.id === h)), explained_by: explained.get(h) || null }))
+  for (const u of unplanned) if (!u.explained_by) exceptions.push({ kind: 'unexplained_deviation', hunks: [u.hunk], where: u.label })
+  // Only a claim the change contradicts is an exception. One the change cannot show (a test run,
+  // a timing) is listed for a person to confirm, without failing the check.
+  for (const c of x.claims.claims) if (c.status === 'contradicted') exceptions.push({ kind: 'unsupported_claim', claim: c.text })
+  for (const d of x.claims.decision_conflicts) exceptions.push({ kind: 'decision_conflict', entry: d.entry, conflicts_with: d.conflicts_with, reason: d.reason || null })
+  const stepExplained = new Map()
+  for (const d of x.claims.deviations) if (d.explained_by && d.step) stepExplained.set(d.step, d.explained_by)
+  return {
+    v: 1,
+    change: x.change,
+    mode: x.mode,
+    head: x.head,
+    dirty: x.dirty,
+    spec_intact: x.unapproved.length === 0,
+    approval: x.approval,
+    plan: {
+      unplanned_files: x.plan.unplannedFiles,
+      unplanned_hunks: unplanned,
+      steps: x.adherence.steps.map(s => ({ id: s.id, status: s.status, note: s.note || null, explained_by: stepExplained.get(s.id) || null })),
+      trace: x.plan.trace,
+    },
+    hunks: x.plan.hunks.map(h => ({ id: h.id, file: h.file, old_start: h.whole ? null : h.oldStart, old_len: h.whole ? null : h.oldLen, new_start: h.whole ? null : h.newStart, new_len: h.whole ? null : h.newLen, preview: hunkPreview(h), where: hunkLabel(h) })),
+    units: x.units.map(u => ({ id: u.id, summary: u.summary || null, hunks: u.hunks, serves: unitServes.get(u.id) || [], extras: (x.mapping.units.find(m => m.unit === u.id) || {}).extras || [] })),
+    items: x.mapping.items,
+    constraints: x.mapping.constraints,
+    unrequested,
+    // Units that serve an agreed extra: requested, and shown in the review as agreed extras.
+    agreed: x.units.filter(u => (unitServes.get(u.id) || []).some(id => agreedIds.has(id))).map(u => u.id),
+    claims: x.claims.claims,
+    for_a_person: x.claims.claims.filter(c => c.status === 'unverifiable').map(c => ({ claim: c.text, why: c.evidence })),
+    exceptions,
+    verdict: exceptions.length === 0 ? 'aligned' : 'exceptions',
+  }
+}
+
+// Judge schemas are built from the spec: every id field is an enum of exactly the ids the
+// agent may use, and every list has exactly one entry per id, so an invented or misplaced id
+// (an O item among the constraints, a C item among the examples) is rejected at the tool call.
+const oneEach = (ids, entry) => ({ type: 'array', minItems: ids.length, maxItems: ids.length, items: entry })
+// An empty enum is unsatisfiable in JSON Schema; with no ids the list is empty anyway.
+const idOf = ids => (ids.length ? { type: 'string', enum: ids } : { type: 'string' })
+const ADHERENCE = pIds => ({ type: 'object', properties: { steps: oneEach(pIds, { type: 'object', properties: { id: idOf(pIds), status: { type: 'string', enum: ['followed', 'deviated', 'not_done'] }, note: { type: 'string', description: 'one line of evidence' } }, required: ['id', 'status', 'note'] }) }, required: ['steps'] })
+const MAPPING = (eIds, cIds, oIds, unitIds, xIds = [], dIds = [], hIds = []) => ({ type: 'object', properties: {
+  units: oneEach(unitIds, { type: 'object', properties: { unit: idOf(unitIds), serves: { type: 'array', items: idOf([...eIds, ...cIds, ...oIds, ...xIds, ...dIds]) }, extras: { type: 'array', description: 'each thing this unit changes that no item needs; empty if none', items: { type: 'object', properties: { text: { type: 'string', description: 'what it changes, in one line' }, hunks: { type: 'array', minItems: 1, items: idOf(hIds) }, near: idOrNull([...eIds, ...cIds, ...oIds, ...xIds, ...dIds]) }, required: ['text', 'hunks', 'near'] } } }, required: ['unit', 'serves', 'extras'] }),
+  items: oneEach(eIds, { type: 'object', properties: { id: idOf(eIds), status: { type: 'string', enum: ['done', 'missing', 'partial', 'contradicts', 'needs_a_person'] }, units: { type: 'array', items: idOf(unitIds) }, note: { type: 'string', description: 'one line of evidence' } }, required: ['id', 'status', 'units', 'note'] }),
+  constraints: oneEach(cIds, { type: 'object', properties: { id: idOf(cIds), status: { type: 'string', enum: ['held', 'violated'] }, note: { type: 'string', description: 'one line of evidence' } }, required: ['id', 'status', 'note'] }),
+}, required: ['units', 'items', 'constraints'] })
+
 // <lib:build> copied from src/lib/build.js by tools/sync-lib.mjs; edit the source, not this copy
 // The builder's log (architecture 5.3): its schema, validation and page. Pure functions only.
 // Needs the spec library (copied before this one): ID, KIND, num, refs, oneLine.
@@ -708,190 +1014,185 @@ function buildPage(log, spec) {
 }
 // </lib:build>
 
-// <lib:pr> copied from src/lib/pr.js by tools/sync-lib.mjs; edit the source, not this copy
-// The pull request (architecture 8.1): a short body from the spec, the check and the build log,
-// filled into the project's template when it has one. It never repeats the review: it links to it.
-// Pure functions only. Needs the spec library (oneLine, commitSubject).
+// <lib:review> copied from src/lib/review.js by tools/sync-lib.mjs; edit the source, not this copy
+// The review (architecture section 8): information for a person reading the change alongside the
+// code. It presents; it never tells the reader how to review. Sections: the goal, what changed and
+// where, warnings (every difference from the approved spec, in a table), and the important or
+// questionable decisions in full. Generated by code from the spec, the build log and the check.
+// Never shows ID codes, and never refers to something by a number defined elsewhere.
+// Needs the spec and build libraries.
 
-// GitHub's own places for a single template, in the order GitHub looks.
-const PR_TEMPLATE_PLACES = ['.github/pull_request_template.md', 'pull_request_template.md', 'docs/pull_request_template.md']
-
-// The template among the repository's tracked files. Several templates in a PULL_REQUEST_TEMPLATE
-// folder are a choice for the author, so none is picked.
-function findTemplate(files) {
-  const lower = new Map(files.map(f => [f.trim().toLowerCase(), f.trim()]))
-  for (const p of PR_TEMPLATE_PLACES) if (lower.has(p)) return { path: lower.get(p), note: null }
-  const many = files.map(f => f.trim()).filter(f => /^(\.github\/|docs\/)?pull_request_template\/[^/]+\.md$/i.test(f))
-  if (many.length === 1) return { path: many[0], note: null }
-  return { path: null, note: many.length ? `the project has ${many.length} pull request templates; none was chosen, so RBB's own sections are used` : null }
-}
-
-// "owner/repo" from a GitHub remote URL, or null for any other remote.
-function githubRepo(url) {
-  const m = /github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/.exec(String(url || '').trim())
-  return m ? `${m[1]}/${m[2]}` : null
-}
-
-// The review at the commit that holds it: still resolves after the records are cleared.
-function reviewLink(repo, sha, change) {
-  const path = `.rbb/${change}/review.md`
-  return repo ? `https://github.com/${repo}/blob/${sha}/${path}` : path
-}
-
-// What a PR reviewer needs before opening the review: the goal; each change, with where it is;
-// the check's result with each difference and each statement to confirm as one line; and the
-// judgment calls, one line each. Headlines only: the reasons and the detail stay in the review.
-function prParts(spec, check, link) {
+// With { reasons: false }, the decisions are one line each and the page says where the reasons are.
+function reviewPage(spec, log, check, opts = {}) {
   const hunks = new Map((check.hunks || []).map(h => [h.id, h]))
   const units = check.units || []
-  const line = t => oneLine(t || '').trim().replace(/\.$/, '')
-  // Where a change is, as lines of the changed code, grouped by file.
-  const where = ids => {
-    const byFile = new Map()
-    for (const id of ids) {
-      const h = hunks.get(id)
-      if (!h) continue
-      const at = h.new_start === undefined || h.new_start === null ? '' : h.new_len === 0 ? `removed after line ${h.new_start}` : h.new_len === 1 ? `line ${h.new_start}` : `lines ${h.new_start}–${h.new_start + h.new_len - 1}`
-      if (!byFile.has(h.file)) byFile.set(h.file, [])
-      if (at) byFile.get(h.file).push(at)
+  const unitOfHunk = new Map(units.flatMap(u => u.hunks.map(h => [h, u])))
+  const b = parseBuild(JSON.stringify(log || { v: 1, entries: [] }), spec)
+  const sentence = t => { const s = oneLine(t).trim(); return !s ? '' : /[.!?]$/.test(s) ? s : `${s}.` }
+
+  // Where a hunk is, as lines of the changed code; a pure removal says where it was removed.
+  const at = id => {
+    const h = hunks.get(id)
+    if (!h) return ''
+    if (h.new_start === undefined || h.new_start === null) return h.where
+    if (h.new_len === 0) return `${h.file}: lines removed after line ${h.new_start}`
+    return h.new_len === 1 ? `${h.file}, line ${h.new_start}` : `${h.file}, lines ${h.new_start}–${h.new_start + h.new_len - 1}`
+  }
+  const where = ids => ids.map(at).filter(Boolean).join('; ')
+  // What the hunks add or remove, from the check's short preview of each.
+  const shows = ids => ids.map(id => (hunks.get(id) || {}).preview).filter(Boolean).map(sentence).join(' ')
+
+  // An item of the spec, by its own words.
+  const all = [...spec.done_when, ...spec.constraints, ...spec.out_of_scope, ...(spec.agreed_extras || [])]
+  const words = id => {
+    const d = spec.decisions.find(x => x.id === id)
+    if (d) return `the decision to ${oneLine(d.choice).replace(/^[A-Z]/, c => c.toLowerCase())}`
+    const i = all.find(x => x.id === id)
+    return i ? `"${oneLine(i.text)}"` : ''
+  }
+  const asked = ids => (ids && ids.length ? ids.map(words).filter(Boolean).join('; ') : 'Nothing in the spec asks for this.')
+  // Where the plan meant to change a file: its symbols and lines, not the whole step.
+  const planned = file => {
+    const locs = spec.plan.steps.flatMap(p => p.locations.filter(l => l.file === file))
+    return locs.length
+      ? `Changes planned only at ${locs.map(l => `${l.symbol ? `${l.symbol}, ` : ''}${l.lines ? `lines ${l.lines.start}–${l.lines.end}` : 'the whole file'}`).join('; ')} (lines before the change).`
+      : `The plan changes nothing in ${file}.`
+  }
+
+  // One row per difference: Item | Location | Reason | What was requested | What the outcome was.
+  const row = e => {
+    switch (e.kind) {
+      case 'unrequested': {
+        const u = units.find(x => x.id === e.unit)
+        return e.extras && e.extras.length
+          ? ['Change not asked for, inside a requested change', where(e.hunks), 'No example, constraint, agreed extra or approved decision asks for it.', e.near ? words(e.near) : asked(u && u.serves), [e.extras.map(x => sentence(typeof x === 'string' ? x : x.text)).join(' '), 'near' in e ? shows(e.hunks) : ''].filter(Boolean).join(' ')]
+          : ['Change not asked for', where(e.hunks), (u && u.serves || []).some(x => x[0] === 'O') ? 'It does something the spec names as out of scope.' : 'No example, constraint, agreed extra or approved decision asks for it.', asked(u && u.serves), sentence(u && u.summary)]
+      }
+      case 'unexplained_deviation': {
+        const h = hunks.get(e.hunks[0]); const u = unitOfHunk.get(e.hunks[0])
+        return ['Changed outside the plan', where(e.hunks), 'No plan step names this place, and the builder logged no reason.', planned(h ? h.file : ''), shows(e.hunks) || sentence(u && u.summary)]
+      }
+      case 'item_missing': case 'item_partial': case 'item_contradicts': case 'item_needs_a_person': {
+        const i = (check.items || []).find(x => x.id === e.item)
+        const label = { item_missing: 'Example not met', item_partial: 'Example only partly met', item_contradicts: 'Example contradicted', item_needs_a_person: 'Example the change alone cannot show' }[e.kind]
+        return [label, where((i && i.units || []).flatMap(uid => (units.find(x => x.id === uid) || { hunks: [] }).hunks)) || 'No change serves it.', sentence(i && i.note), words(e.item), label]
+      }
+      case 'constraint_violated': {
+        const c = (check.constraints || []).find(x => x.id === e.item)
+        return ['Constraint broken', '', sentence(c && c.note), words(e.item), sentence(c && c.note)]
+      }
+      case 'step_not_done': {
+        const s = ((check.plan && check.plan.steps) || []).find(x => x.id === e.step)
+        const p = spec.plan.steps.find(x => x.id === e.step)
+        return ['Plan step not done', p ? p.locations.map(l => `${l.file}${l.lines ? `, lines ${l.lines.start}–${l.lines.end} (before the change)` : ''}`).join('; ') : '', sentence(s && s.note), sentence(p && p.does), 'Not done.']
+      }
+      case 'unsupported_claim': {
+        const c = (check.claims || []).find(x => x.text === e.claim)
+        return ["The builder's claim is contradicted", '', sentence(c && c.evidence), '', `The builder said: "${oneLine(e.claim)}"`]
+      }
+      case 'decision_conflict': {
+        const d = b.decisions.find(x => x.id === e.entry)
+        return ['A build decision goes against the spec', '', sentence(e.reason), words(e.conflicts_with), d ? sentence(d.choice) : '']
+      }
+      case 'spec_integrity': return ['The approved spec was changed without approval', '', sentence(e.detail), 'The spec as approved.', 'Changed by a later commit.']
+      default: return [e.kind, '', '', '', '']
     }
-    return [...byFile].map(([f, a]) => `\`${f}\`${a.length ? ` ${a.join(', ')}` : ''}`).join('; ')
   }
-  const changes = units.map(u => `- ${line(u.summary || 'A change')}.${u.hunks.length ? `\n  - Where: ${where(u.hunks)}` : ''}`)
 
-  // Each difference from the approved spec, as one line: what it is, and where.
-  const item = id => { const i = [...spec.done_when, ...spec.constraints, ...spec.out_of_scope].find(x => x.id === id); return i ? `"${line(i.text)}"` : 'an item of the spec' }
-  const step = id => { const p = spec.plan.steps.find(x => x.id === id); return p ? `"${line(p.does)}"` : 'a plan step' }
-  const label = e => ({
-    unrequested: e.extras && e.extras.length ? `Not asked for: ${line(typeof e.extras[0] === 'string' ? e.extras[0] : e.extras[0].text)}` : 'A change nobody asked for',
-    unexplained_deviation: 'Changed outside the plan, with no reason logged',
-    item_missing: `Example not met: ${item(e.item)}`, item_partial: `Example only partly met: ${item(e.item)}`,
-    item_contradicts: `Example contradicted: ${item(e.item)}`, item_needs_a_person: `Example the change alone cannot show: ${item(e.item)}`,
-    constraint_violated: `Constraint broken: ${item(e.item)}`, step_not_done: `Plan step not done: ${step(e.step)}`,
-    unsupported_claim: `The builder's claim is contradicted: "${line(e.claim)}"`,
-    decision_conflict: 'A build decision goes against the approved spec', spec_integrity: 'The approved spec was changed without approval',
-  }[e.kind] || e.kind)
-  const explained = ((check.plan && check.plan.unplanned_hunks) || []).filter(u => u.explained_by)
-  const differences = [
-    ...(check.exceptions || []).map(e => `- ${label(e)}${e.hunks && e.hunks.length ? ` (${where(e.hunks)})` : ''}.`),
-    ...explained.map(u => `- Changed outside the plan, with the builder's reason (${where([u.hunk])}).`),
-  ]
-  const confirm = (check.for_a_person || []).map(c => `- "${line(c.claim)}"`)
-  // Mode none has no review file to link to: the review is collapsed at the end of the body.
-  const review = link ? `[the review](${link})` : 'the review at the end'
-  const result = check.verdict === 'error'
-    ? `RBB's check of this change did not complete. See ${review}.`
-    : [
-        `RBB checked the change against its approved spec: ${differences.length ? `${differences.length} difference${differences.length === 1 ? '' : 's'}` : 'no differences'}. Each one, with its reason and the code, is in ${review}.`,
-        differences.join('\n'),
-        confirm.length ? `The builder also says the following, which the change alone cannot show; a person should confirm it:\n\n${confirm.join('\n')}` : '',
-      ].filter(Boolean).join('\n\n')
-  const calls = spec.decisions.filter(d => d.judgment !== false).map(d => `- ${line(d.choice)}.`)
-  // Defects the scout found off the path, left alone by this change: one line each, for the reviewer.
-  const followUps = (spec.follow_ups || []).map(f => `- ${line(f.text)}.`)
-  // What no example exercises: what the reviewer should know before reading, one line each.
-  const focus = (spec.review_focus || []).map(f => `- ${line(f)}.`)
-  return { goal: oneLine(spec.goal), changes: changes.join('\n') || '- No code changed.', check: result, decisions: calls.join('\n'), follow_ups: followUps.join('\n'), review_focus: focus.join('\n') }
-}
+  const parts = [`# Review: ${spec.title || spec.change}`, `## Goal\n\n${spec.goal}`]
 
-function prBody(parts) {
-  return [
-    `## Goal\n\n${parts.goal}`,
-    `## What changed\n\n${parts.changes}`,
-    `## Check\n\n${parts.check}`,
-    parts.review_focus ? `## What no example exercises\n\nYou should know these before reading the change.\n\n${parts.review_focus}` : '',
-    parts.decisions ? `## Decisions worth a look\n\nJudgment calls made while planning; why each was made, and the alternatives, are in the review.\n\n${parts.decisions}` : '',
-    parts.follow_ups ? `## Found along the way, not part of this change\n\n${parts.follow_ups}` : '',
-  ].filter(Boolean).join('\n\n') + '\n'
-}
+  // What changed, each change once, with where it is in the changed code.
+  parts.push(`## What changed\n\n${units.length ? units.map(u => `- ${sentence(u.summary || 'A change')} *${where(u.hunks)}*`).join('\n') : 'Nothing.'}`)
+  // What the scout saw that no example exercises, and the defects it found off the path, which this
+  // change leaves alone: the reviewer should know both before reading on.
+  if (spec.review_focus && spec.review_focus.length) parts.push(reviewFocusSection(spec))
+  if (spec.follow_ups && spec.follow_ups.length) parts.push(followUpsSection(spec))
 
-// Who drafted it, for a template that asks: the tool, and the models that made the decisions, with
-// their effort, from the stamps in the spec and the build log (section 5.1.2).
-function prFacts(spec, log) {
-  const roles = new Map()
-  const add = (w, role) => {
-    if (!w || w.by !== 'model' || !w.model) return
-    const key = `${w.model}${w.effort ? ` at ${w.effort} effort` : ''}`
-    if (!roles.has(key)) roles.set(key, [])
-    if (!roles.get(key).includes(role)) roles.get(key).push(role)
-  }
-  for (const d of spec.decisions || []) { add(d.decided_by, 'planning'); if (d.alternatives_reviewed_by) add({ by: 'model', ...d.alternatives_reviewed_by }, 'reviewing alternatives') }
-  for (const e of (log && log.entries) || []) if (e.kind === 'decision' || e.kind === 'deviation') { add(e.decided_by, 'building'); if (e.alternatives_reviewed_by) add({ by: 'model', ...e.alternatives_reviewed_by }, 'reviewing alternatives') }
-  const models = [...roles].map(([m, r]) => `${m} (${r.join(', ')})`).join('; ')
-  return { tool: 'RBB (Record Before Build), a Claude Code plugin', models: models || 'not recorded', notes: 'Built from a spec the requester approved; the review linked above checks the change against it.' }
-}
-
-const SUMMARY_HEADING = /summary|description|what|changes?\b|overview|motivation|context|why|purpose/i
-const AGENT_HEADING = /\bagents?\b|\bai\b|\bllm\b|\bmodels?\b|assist|automat|generat|drafting/i
-
-// The template, its parts kept: preamble, headings, comments and checklists. The summary goes into
-// the first summary section, or a new one at the end; an AI-assistance section has its empty
-// "Label:" lines filled from the record. Checkboxes are never ticked.
-function fillTemplate(text, parts, facts) {
-  const lines = String(text).replace(/\r\n/g, '\n').split('\n')
-  const sections = [{ heading: null, lines: [] }]
-  for (const l of lines) {
-    if (/^#{1,6}\s/.test(l)) sections.push({ heading: l, lines: [] })
-    else sections[sections.length - 1].lines.push(l)
-  }
-  const summary = [parts.goal, `**What changed**\n\n${parts.changes}`, `**Check**\n\n${parts.check}`, parts.decisions ? `**Decisions worth a look** (why, and the alternatives, are in the review)\n\n${parts.decisions}` : ''].filter(Boolean).join('\n\n')
-  const isSummary = s => s.heading && SUMMARY_HEADING.test(s.heading) && !AGENT_HEADING.test(s.heading)
-  const target = sections.find(isSummary)
-  const fill = l => {
-    const m = /^(\s*(?:[-*]\s+)?)([A-Za-z][A-Za-z /()-]*?):\s*$/.exec(l)
-    if (!m) return l
-    const label = m[2].toLowerCase()
-    const value = /model/.test(label) ? facts.models : /agent|tool|assistant/.test(label) ? facts.tool : /note/.test(label) ? facts.notes : null
-    return value ? `${m[1]}${m[2]}: ${value}` : l
-  }
-  const out = sections.map(s => {
-    let body = s.lines
-    if (s.heading && AGENT_HEADING.test(s.heading)) body = body.map(fill)
-    if (s === target) {
-      const kept = body.join('\n').trim()
-      return [s.heading, '', ...(kept ? [kept, ''] : []), summary, ''].join('\n')
-    }
-    return [...(s.heading ? [s.heading] : []), ...body].join('\n')
+  // A change outside the plan that the builder explained is not an exception, but it is still a
+  // difference from the approved plan: it is shown with the builder's own reason.
+  const cap = t => (/^[a-z]+[\s,:;]/.test(t) ? t.replace(/^[a-z]/, x => x.toUpperCase()) : t) // a file or code name keeps its case
+  const logged = id => [...b.deviations, ...b.decisions].find(x => x.id === id)
+  const explainedRows = ((check.plan && check.plan.unplanned_hunks) || []).filter(u => u.explained_by).map(u => {
+    const h = hunks.get(u.hunk); const l = logged(u.explained_by); const u2 = unitOfHunk.get(u.hunk)
+    const reason = !l ? 'The builder logged a reason.' : l.kind === 'deviation' ? `The builder's logged reason: ${cap(sentence(l.because))}` : `The builder's logged decision: ${cap(sentence(l.choice))} ${cap(sentence(l.because))}`
+    return ['Changed outside the plan, with a reason', at(u.hunk), reason, planned(h ? h.file : ''), shows([u.hunk]) || sentence(u2 && u2.summary)]
   })
-  let result = out.join('\n').replace(/\n{3,}/g, '\n\n').trim()
-  if (!target) result += `\n\n## Summary\n\n${summary}`
-  return result + '\n'
-}
 
-// Mode none (architecture 9.1): the review itself, collapsed, and the approved spec's hash, which is
-// the only evidence in the repository that the spec was not changed after approval. With no review
-// text (the agent saving the body was refused for copying it), the body says where the review is.
-function noneAppendix(reviewText, hashes, reviewPath) {
-  const ids = Object.entries(hashes).map(([f, h]) => `- \`${f}\`: \`${h}\``).join('\n')
-  const review = reviewText
-    ? `<details>\n<summary>The full review</summary>\n\n${String(reviewText).trim()}\n\n</details>`
-    : `The full review is not in this body: the agent saving the body was not allowed to copy it. The requester holds it on their machine as \`${reviewPath || 'review.md'}\`.`
-  return `\n${review}\n\nThe approved spec's files, by git blob id:\n\n${ids}\n\nThis repository keeps no RBB files, so these ids, kept by the requester, are the only evidence that the spec was not changed after approval.\n`
-}
+  // Warnings: the summary, how complete the check was, then every difference.
+  const n = (check.exceptions || []).length + explainedRows.length
+  const total = (check.hunks || []).length
+  const files = new Set((check.hunks || []).map(h => h.file)).size
+  const summary = check.verdict === 'error'
+    ? `**The check could not complete:** ${check.error ? sentence(check.error.reason) : 'reason unknown.'} Nothing below has been checked.`
+    : n === 0
+      ? '**No differences from the approved spec were found.**'
+      : `**${n} difference${n === 1 ? '' : 's'} from the approved spec.**`
+  const coverage = check.verdict === 'error' ? '' : `All ${total} changed place${total === 1 ? '' : 's'}, in ${files} file${files === 1 ? '' : 's'}, were checked against the spec; none was left unaccounted for. The check judges what the change does, not whether the code is correct beyond the examples.`
+  const warnings = [summary, coverage]
+  if (n) warnings.push(table(['Item', 'Location', 'Reason', 'What was requested', 'What the outcome was'], [...(check.exceptions || []).map(row), ...explainedRows]))
+  if (check.for_a_person && check.for_a_person.length) warnings.push(`**Not verified.** The builder says the following, and the change alone cannot show it. The person who ran the build should confirm it:\n\n${check.for_a_person.map(c => `- "${oneLine(c.claim)}" ${sentence(c.why)}`).join('\n')}`)
+  parts.push(`## Warnings\n\n${warnings.filter(Boolean).join('\n\n')}`)
 
-// The PR title: the spec's title, safe to pass as a quoted argument.
-function prTitle(spec) {
-  return String(spec.title || spec.change).replace(/["'`$\\]/g, '').replace(/\s+/g, ' ').trim()
+  // Decisions: the judgment calls of the spec and the builder's own, in full.
+  const decision = (d, origin) => [`### ${sentence(d.choice)}`, ...decisionLines(d, origin)].join('\n')
+  const brief = (d, origin) => `- ${sentence(d.choice)} ${origin}`
+  const calls = spec.decisions.filter(d => d.judgment !== false)
+  if (opts.reasons === false) {
+    const lines = [...calls.map(d => brief(d, 'Made while planning.')), ...b.decisions.map(d => brief(d, 'Made while building.'))]
+    parts.push(`## Decisions\n\nThe choices a competent developer could have made another way.\n\n${lines.length ? `${lines.join('\n')}\n\n${reasonsLeftOut(['scout.json', 'plan.json', 'build.json'])}` : 'None.'}`)
+  } else {
+    parts.push(`## Decisions\n\nThe choices a competent developer could have made another way, with the reasoning behind each.\n\n${[...calls.map(d => decision(d, 'Made while planning.')), ...b.decisions.map(d => decision(d, 'Made while building.'))].join('\n\n') || 'None.'}`)
+  }
+  return parts.join('\n\n') + '\n'
 }
+// </lib:review>
 
-// The commit that holds the check and the review, in the project's commit style.
-function recordsSubject(spec, style) {
-  const prefix = style && style.kind === 'conventional' ? `${style.type || 'docs'}${style.scope ? `(${style.scope})` : ''}: record the check of ` : 'Record the check: '
-  return commitSubject(prefix, spec.title || spec.change)
+// The claims judge answers only with ids that exist: unplanned hunk ids, the log's deviation
+// ids (or null), plan step ids (or null), claim ids, decision ids and the spec's D and C ids.
+const idOrNull = ids => (ids.length ? { type: ['string', 'null'], enum: [...ids, null] } : { type: 'null' })
+const CLAIMS = (hunkIds, devIds, stepIds, claimIds, decisionIds, dcIds) => ({ type: 'object', properties: {
+  deviations: oneEach(hunkIds, { type: 'object', properties: { hunk: idOf(hunkIds), explained_by: idOrNull([...devIds, ...decisionIds]), step: idOrNull(stepIds) }, required: ['hunk', 'explained_by', 'step'] }),
+  claims: oneEach(claimIds, { type: 'object', properties: { id: idOf(claimIds), status: { type: 'string', enum: ['supported', 'contradicted', 'unverifiable'], description: 'unverifiable when the change cannot show it either way, such as a test run' }, evidence: { type: 'string', description: 'one line' } }, required: ['id', 'status', 'evidence'] }),
+  decision_conflicts: { type: 'array', maxItems: decisionIds.length ? decisionIds.length * Math.max(1, dcIds.length) : 0, items: { type: 'object', properties: { entry: idOf(decisionIds), conflicts_with: idOf(dcIds), reason: { type: 'string', description: 'one line' } }, required: ['entry', 'conflicts_with', 'reason'] } },
+}, required: ['deviations', 'claims', 'decision_conflicts'] })
+
+function claimsCoverage(hunkIds, claimIds, r) {
+  return [
+    ...sameIds('unplanned hunks', hunkIds, r.deviations.map(d => d.hunk)),
+    ...sameIds('claims', claimIds, r.claims.map(c => c.id)),
+  ]
 }
-
-function recordsCommands(change, subject) {
-  const files = `.rbb/${change}/check.json .rbb/${change}/review.md`
-  return [`git add -- ${files}`, `git commit -m "${subject}" -- ${files}`]
-}
-// </lib:pr>
-
-const READBACK_SCHEMA_PR = { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] }
-// refused separates a command that was never allowed to run from one that printed nothing.
-const RELAY_PR = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, { type: 'string', description: `stdout of the command labelled ${k}, verbatim` }])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run; empty if all ran' } }, required: [...keys, 'refused'] })
-const DEFAULT_BRANCH = /^(main|master|develop|trunk)$/
 
 // </pure>
+
+// ---- schemas for agent outputs ----
+const str = d => ({ type: 'string', description: d })
+// refused separates a command that was never allowed to run from one that ran and printed nothing:
+// both give an empty string, and two matching empty relays would otherwise pass as an empty change.
+const RELAY = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, str(`stdout of the command labelled ${k}, verbatim`)])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run (refused, denied, or waiting for approval); empty if all ran' } }, required: [...keys, 'refused'] })
+const UNITS = { type: 'object', properties: { units: { type: 'array', items: { type: 'object', properties: { id: str('U1, U2, ...'), summary: str('one line: what this unit does'), hunks: { type: 'array', items: str('hunk id') } }, required: ['id', 'summary', 'hunks'] } } }, required: ['units'] }
+
+
+const RELAY_PROMPT = cmds => `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label: every character and newline, nothing added, removed or summarised. Return standard output only: never an error message the command printed instead. If a command prints nothing to standard output, or fails, return an empty string for it. If you were not allowed to run a command (it was refused, denied, or needs approval), return an empty string for it and list its label under refused; a command that ran and exited with an error is not refused.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
+
+const { change, mode } = parseArgs(args)
+const DIFF = `git -c core.quotepath=false diff --no-renames --no-color --no-ext-diff`
+const specPath = `.rbb/${change}/spec.json`
+const outPath = `.rbb/${change}/check.json`
+
+async function relay(label, cmds) {
+  // Nothing to run: nothing to relay, and no schema with an empty enum, which the host rejects.
+  if (!cmds.length) return { out: {}, attempts: 0 }
+  const keys = cmds.map(([k]) => k)
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const [a, b] = await parallel([1, 2].map(i => () => agent(RELAY_PROMPT(cmds), { label: `${label} ${attempt}.${i}`, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: RELAY(keys) })))
+    const refused = [...new Set([...((a && a.refused) || []), ...((b && b.refused) || [])])]
+    if (refused.length) return { refused: refused.map(k => cmds.find(([l]) => l === k)[1]) }
+    if (a && b && keys.every(k => canon(a[k]) === canon(b[k]))) return { out: Object.fromEntries(keys.map(k => [k, canon(a[k])])), attempts: attempt }
+    log(`${label}: the two relays differ (attempt ${attempt})`)
+  }
+  return null
+}
 
 // <lib:record> copied from src/lib/record.js by tools/sync-lib.mjs; edit the source, not this copy
 // Save a file from inside a workflow and verify it by reading it back (architecture 5.2).
@@ -932,140 +1233,166 @@ async function recordPage(path, full, reduced, phase) {
 }
 // </lib:record>
 
-// The skill passes {"change": ...}; an agent that passes the argument text itself means its first word.
-const change = typeof args === 'string' ? args.trim().split(/\s+/)[0] : args && args.change
-if (!change || !/^[a-z0-9][a-z0-9-]*$/.test(change)) return { error: 'rbb:pr needs a change name' }
-const dir = `.rbb/${change}`
-
-async function relay(label, cmds) {
-  const keys = cmds.map(([k]) => k)
-  const prompt = `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label. If a command prints nothing, or fails, return an empty string for it. If you were not allowed to run a command, return an empty string and list its label under refused.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
-  // Nothing to run: nothing to relay, and no schema with an empty enum, which the host rejects.
-  if (!cmds.length) return { out: {} }
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const [a, b] = await parallel([1, 2].map(i => () => agent(prompt, { label: `${label} ${attempt}.${i}`, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: RELAY_PR(keys) })))
-    const refused = [...new Set([...((a && a.refused) || []), ...((b && b.refused) || [])])]
-    if (refused.length) return { refused: refused.map(k => cmds.find(([l]) => l === k)[1]) }
-    if (a && b && keys.every(k => String(a[k]).trim() === String(b[k]).trim())) return { out: Object.fromEntries(keys.map(k => [k, String(a[k]).replace(/\s+$/, '')])) }
-  }
-  return null
+// check.json is compared as data, so formatting differences in the read-back don't matter.
+function record(result) {
+  const sameData = t => { try { return JSON.stringify(JSON.parse(t)) === JSON.stringify(result) } catch (e) { return false } }
+  return recordFile(outPath, JSON.stringify(result, null, 2) + '\n', 'Record', sameData)
 }
-const refusedError = r => ({ change, error: `these read-only commands were not allowed to run; allow them and try again: ${r.refused.join(' ; ')}` })
+
+async function fail(stage, reason, extra) {
+  const result = { v: 1, change, mode, verdict: 'error', error: { stage, reason }, ...(extra || {}) }
+  result.recorded = await record(result)
+  return result
+}
+
+if (!change) throw new Error('rbb:check-change needs a change name')
 
 phase('Facts')
-const f = await relay('facts', [
-  ['head', 'git rev-parse HEAD'],
-  ['branch', 'git branch --show-current'],
-  ['remote', 'git remote get-url origin'],
-  ['status', `git status --porcelain=v1 -uall -- . ':(exclude).rbb'`],
-  ['records', `git status --porcelain=v1 -uall -- ${dir}/check.json ${dir}/review.md`],
-  ['files', 'git -c core.quotepath=false ls-files'],
-  ...SPEC_FILES.map((name, n) => [`s${n}`, `git show HEAD:${dir}/${name}`]),
-  ['build', `git show HEAD:${dir}/build.json`],
-  ['build_meta', `git show HEAD:${dir}/build-meta.json`],
-])
-if (f && f.refused) return refusedError(f)
-if (!f || !/^[0-9a-f]{40}$/.test(f.out.head)) return { change, error: 'the two relays of git facts disagreed or failed' }
-if (f.out.status) return { change, error: 'the working tree has uncommitted changes outside .rbb, which the check does not cover; commit them and run the check again', status: f.out.status }
-// Documents mode (architecture 9.1): in mode none the records are local files, and the spec must
-// have the hash it was approved with.
-const readFile = async (file, label) => { const b = await agent(`Read the file ${file} and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA_PR }); return b ? b.content : '' }
-const parse = t => { try { return t && t.trim() ? JSON.parse(t) : null } catch (e) { return null } }
-const config = parse(await readFile('.rbb/config.json', 'read config'))
+// Documents mode (architecture 9.1). In mode none the spec and the build log are local, ignored
+// files: each is read twice and compared, like the git facts, and the spec must have the approved hash.
+const cfgBack = await agent('Read the file .rbb/config.json and return its content verbatim, without line numbers. If it does not exist, return an empty string.', { label: 'read config', phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })
+let config = null
+try { config = cfgBack && cfgBack.content.trim() ? JSON.parse(cfgBack.content) : null } catch (e) { config = null }
 const none = documentsMode(config) === 'none'
-// The spec is rebuilt in memory from its manifest and the files it names (architecture 5.2.1).
-let texts = null, log = null, approval = null
-if (none) {
-  approval = parse(await readFile(`${dir}/approval.json`, 'read approval'))
-  if (approvalProblems(approval, change).length) return { change, error: `no valid approval for ${change}; approve the spec first` }
-  // The files the approval froze are hashed again: the manifest at approval time names them.
-  const hashed = await relay('spec hashes', [['hashes', `git hash-object ${hashedFiles(approval).map(name => `${dir}/${name}`).join(' ')}`]])
-  if (hashed && hashed.refused) return refusedError(hashed)
-  if (!hashed) return { change, error: 'the two relays of the spec hashes disagreed or failed' }
-  const changed = changedSpecFiles(approval, hashed.out.hashes)
-  if (changed.length) return { change, error: `the spec changed after it was approved (${changed.join(', ')}); approve it again` }
-  const read = await parallel(SPEC_FILES.map(name => () => readFile(`${dir}/${name}`, `read ${name}`)))
-  texts = Object.fromEntries(SPEC_FILES.map((name, n) => [name, read[n]]))
-  log = parse(buildLogText(await readFile(`${dir}/build.json`, 'read build log'), await readFile(`${dir}/build-meta.json`, 'read build meta')))
-} else {
-  texts = Object.fromEntries(SPEC_FILES.map((name, n) => [name, f.out[`s${n}`]]))
-  log = parse(buildLogText(f.out.build, f.out.build_meta))
+async function readTwice(file, label) {
+  const [a, b] = await parallel([1, 2].map(i => () => agent(`Read the file ${file} and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label: `${label} ${i}`, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })))
+  return a && b && canon(a.content) === canon(b.content) ? canon(a.content) : null
 }
-const built = specFromTexts(change, texts)
-const spec = built.spec || null
-if (!spec || validateSpec(spec, change).length) return { change, error: `the spec is not committed at HEAD, or does not meet its format${built.error ? ` (${built.error})` : ''}; approve the spec first` }
 
-const back = await agent(`Read the file ${dir}/check.json and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label: 'read check', phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA_PR })
-let check = null
-try { check = back && back.content.trim() ? JSON.parse(back.content) : null } catch (e) { check = null }
-if (!check) return { change, error: `${dir}/check.json is missing or not JSON; run /rbb:check first` }
-if (check.verdict === 'error') return { change, error: `the last check did not complete (${check.error ? check.error.reason : 'unknown reason'}); run /rbb:check again` }
-if (!/^[0-9a-f]{40}$/.test(check.head || '')) return { change, error: 'the check does not record the commit it checked; run /rbb:check again' }
-
-// Covered: the code at the checked commit is the code at HEAD. Commits since then may only touch .rbb.
-const cov = await relay('covered', [
-  ['kind', `git cat-file -t ${check.head}`],
-  ['changed', `git -c core.quotepath=false diff --name-only ${check.head} HEAD -- . ':(exclude).rbb'`],
-  ['review', `git ls-files --others --cached -- ${dir}/review.md`],
+// The spec is its manifest and the files it names (architecture 5.2.1); its integrity covers them all.
+const specPaths = SPEC_FILES.map(f => `.rbb/${change}/${f}`)
+const factsA = await relay('head and approvals', [
+  ['head', 'git rev-parse HEAD'],
+  ['status', `git status --porcelain=v1 -uall -- . ':(exclude).rbb'`],
+  ...(none ? [] : [
+    ['log', `git log --format='%H %(trailers:key=RBB-Approved,valueonly,separator=%x2C)' -- ${specPaths.join(' ')}`],
+    ['build', `git show HEAD:.rbb/${change}/build.json`],
+    ['build_meta', `git show HEAD:.rbb/${change}/build-meta.json`],
+  ]),
 ])
-if (cov && cov.refused) return refusedError(cov)
-if (!cov || cov.out.kind !== 'commit') return { change, error: `the checked commit ${check.head.slice(0, 10)} is not in this repository; run /rbb:check again` }
-if (cov.out.changed) return { change, error: 'the code changed after the check; run /rbb:check again', changed: cov.out.changed.split('\n') }
-const reviewText = none ? await readFile(`${dir}/review.md`, 'read review') : null
-if (none ? !reviewText.trim() : !cov.out.review) return { change, error: `${dir}/review.md is missing; run /rbb:check again` }
+if (factsA && factsA.refused) return await fail('permission', `these read-only commands were not allowed to run; allow them and run the check again: ${factsA.refused.join(' ; ')}`)
+if (!factsA) return await fail('facts', 'relays of HEAD, status and the approval log never matched')
 
-phase('Commit')
-// In mode none nothing is committed. Otherwise the check and the review are, in the project's style.
-let committed = null, sha = null
-if (!none && f.out.records) {
-  const subject = recordsSubject(spec, config && config.commit)
-  const cmds = recordsCommands(change, subject)
-  await agent(`Run these commands:\n${cmds.map((c, n) => `${n + 1}. ${c}`).join('\n')}`, { label: 'commit records', phase: 'Commit', agentType: 'rbb:committer', effort: 'low' })
-  committed = subject
+let approvals, specText, buildText, factsB = null
+if (none) {
+  let approval = null
+  try { approval = JSON.parse(await readTwice(`.rbb/${change}/approval.json`, 'approval')) } catch (e) { approval = null }
+  if (approvalProblems(approval, change).length) return await fail('facts', `no valid approval for ${change}: approve the spec first`, { approval_problems: approvalProblems(approval, change) })
+  // The files the approval froze are hashed again: the manifest at approval time names them.
+  const hashed = await relay('spec hashes', [['hash', `git hash-object ${hashedFiles(approval).map(f => `.rbb/${change}/${f}`).join(' ')}`]])
+  if (hashed && hashed.refused) return await fail('permission', `these read-only commands were not allowed to run; allow them and run the check again: ${hashed.refused.join(' ; ')}`)
+  if (!hashed) return await fail('facts', 'relays of the spec hashes never matched')
+  const changed = changedSpecFiles(approval, hashed.out.hash)
+  if (changed.length) return await fail('spec', `the spec changed after it was approved: ${changed.join(', ')} no longer has its approved hash`)
+  const texts = await parallel(SPEC_FILES.map(f => () => readTwice(`.rbb/${change}/${f}`, f)))
+  if (texts.some(t => t === null)) return await fail('facts', 'the two reads of a spec file never matched')
+  specText = Object.fromEntries(SPEC_FILES.map((f, n) => [f, texts[n]]))
+  buildText = buildLogText((await readTwice(`.rbb/${change}/build.json`, 'build log')) || '', (await readTwice(`.rbb/${change}/build-meta.json`, 'build meta')) || '')
+  approvals = { latest: `spec hashes, ${approval.hashes['spec.json'].slice(0, 10)}`, unapproved: [] }
+} else {
+  approvals = parseLog(factsA.out.log, change)
+  if (!approvals.latest) return await fail('facts', `no approval commit for ${change}: the spec has no commit with the trailer RBB-Approved: ${change}`)
+  factsB = await relay('spec', SPEC_FILES.map((f, n) => [`f${n}`, `git show ${approvals.latest}:.rbb/${change}/${f}`]))
+  if (factsB && factsB.refused) return await fail('permission', `these read-only commands were not allowed to run; allow them and run the check again: ${factsB.refused.join(' ; ')}`)
+  if (!factsB) return await fail('facts', 'relays of the approved spec never matched')
+  specText = Object.fromEntries(SPEC_FILES.map((f, n) => [f, factsB.out[`f${n}`]]))
+  buildText = buildLogText(factsA.out.build, factsA.out.build_meta)
 }
-// Verified from git, not from the committer's report: the records are committed and unchanged.
-if (!none) {
-  const v = await relay('verify', [
-    ['records', `git status --porcelain=v1 -uall -- ${dir}/check.json ${dir}/review.md`],
-    ['sha', `git log -1 --format=%H -- ${dir}/review.md`],
-  ])
-  if (v && v.refused) return refusedError(v)
-  if (!v || v.out.records || !/^[0-9a-f]{40}$/.test(v.out.sha)) return { change, error: 'the check and the review could not be committed; check git status' }
-  sha = v.out.sha
+const builtSpec = specFromTexts(change, specText)
+if (!builtSpec.spec) return await fail('spec', `the approved spec could not be rebuilt: ${builtSpec.error}`)
+const spec = builtSpec.spec
+const specErrors = validateSpec(spec, change)
+if (specErrors.length) return await fail('spec', 'the approved spec does not meet the schema', { spec_errors: specErrors })
+
+const factsC = await relay('diff', [
+  ['diff', `${DIFF} -U0 ${spec.base} HEAD -- . ':(exclude).rbb'`],
+  ['numstat', `${DIFF} --numstat ${spec.base} HEAD -- . ':(exclude).rbb'`],
+])
+if (factsC && factsC.refused) return await fail('permission', `these read-only commands were not allowed to run; allow them and run the check again: ${factsC.refused.join(' ; ')}`)
+if (!factsC) return await fail('facts', 'relays of the diff never matched')
+let diffFiles, numstat
+try { diffFiles = parseDiff(factsC.out.diff); numstat = parseNumstat(factsC.out.numstat) } catch (e) { return await fail('facts', e.message) }
+const crossProblems = crossCheck(diffFiles, numstat)
+if (crossProblems.length) return await fail('facts', 'the diff and numstat disagree', { cross_check: crossProblems })
+
+const plan = planFacts(spec, diffFiles)
+const diffView = annotate(plan.hunks)
+const hunkIds = plan.hunks.map(h => h.id)
+const specView = JSON.stringify({ goal: spec.goal, done_when: spec.done_when, constraints: spec.constraints, out_of_scope: spec.out_of_scope, agreed_extras: spec.agreed_extras || [], decisions: spec.decisions, plan: spec.plan }, null, 2)
+log(`${plan.hunks.length} hunks; ${plan.unplannedHunks.length} outside the plan`)
+
+phase('Judge')
+let units
+if (mode === 'per-hunk') {
+  units = plan.hunks.map(h => ({ id: h.id, summary: null, hunks: [h.id] }))
+} else {
+  for (let attempt = 1; attempt <= 2 && !units; attempt++) {
+    const g = await agent(`Group these hunks into logical units: one unit per coherent change (one behaviour, one refactor, one doc entry). Every hunk must be in exactly one unit. Give each unit an id (U1, U2, ...) and a one-line summary of what it does.\n\nThe change, each hunk labelled with its id and its range in the base commit:\n\n${diffView}`, { label: `group ${attempt}`, phase: 'Judge', agentType: 'rbb:checker', effort: 'high', schema: UNITS })
+    if (g && checkUnits(g.units, hunkIds).length === 0) units = g.units
+    else log(`grouping attempt ${attempt} did not cover every hunk exactly once`)
+  }
+  if (!units) return await fail('grouping', 'no grouping covered every hunk exactly once')
+}
+const unitView = units.map(u => `${u.id}${u.summary ? `: ${u.summary}` : ''} [${u.hunks.join(', ')}]`).join('\n')
+
+// Each judge answers through a schema built from the spec; if its answer still fails the
+// coverage backstop, that judge alone runs once more before the check ends in an error.
+async function judge(label, effort, prompt, schema, problemsOf) {
+  let last = ['returned nothing']
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const r = await agent(prompt, { label: attempt === 1 ? label : `${label} (retry)`, phase: 'Judge', agentType: 'rbb:checker', effort, schema })
+    if (r && (last = problemsOf(r)).length === 0) return { r, attempts: attempt }
+    log(`${label}: ${last.join('; ')}`)
+  }
+  return { r: null, problems: last }
+}
+const eIds = spec.done_when.map(i => i.id), cIds = spec.constraints.map(i => i.id), oIds = spec.out_of_scope.map(i => i.id)
+const [adh, map] = await parallel([
+  () => judge('plan adherence', 'medium', ADHERENCE_PROMPT(), ADHERENCE(spec.plan.steps.map(s => s.id)), r => adherenceCoverage(spec, r)),
+  () => judge('spec mapping', 'high', MAPPING_PROMPT(), MAPPING(eIds, cIds, oIds, units.map(u => u.id), (spec.agreed_extras || []).map(i => i.id), spec.decisions.map(d => d.id), plan.hunks.map(h => h.id)), r => mappingCoverage(spec, units, r)),
+])
+if (!adh || !adh.r || !map || !map.r) return await fail('judge', 'a judging agent did not cover every id exactly once', { coverage: [...((adh && adh.problems) || []), ...((map && map.problems) || [])] })
+const adherence = adh.r, mapping = map.r
+
+function ADHERENCE_PROMPT() { return `Judge whether the change followed each step of the approved plan. Use only the plan, the change and the trace below.\n\nFor each plan step: followed (its changes are made at the locations it named), deviated (it was done, but partly or wholly elsewhere or otherwise than planned), or not_done (its changes are absent). Give one line of evidence each. The evidence is shown to people: name code by file, line and function, and the spec's items in words, never by an id such as a hunk, step or item code.\n\nThe approved spec and plan:\n${specView}\n\nWhich hunks touched each planned location (computed by code):\n${JSON.stringify(plan.trace, null, 2)}\n\nHunks outside every planned location: ${plan.unplannedHunks.join(', ') || 'none'}\n\nThe change:\n\n${diffView}` }
+function MAPPING_PROMPT() { return `Map the change to the approved spec, starting from the spec's side.\n\n- For each done-when item (E...): done, missing, partial or contradicts, or needs_a_person when the change alone cannot settle it, with the ${mode === 'per-hunk' ? 'hunks' : 'units'} that serve it.\n- For each constraint (C...): held or violated by the change.\n- For each ${mode === 'per-hunk' ? 'hunk' : 'unit'}: the E, C, O, X or D items it serves. A change an approved decision (D...) calls for serves that decision. An agreed extra (X...) is something the requester agreed to beyond the request; a ${mode === 'per-hunk' ? 'hunk' : 'unit'} that does one serves it. A ${mode === 'per-hunk' ? 'hunk' : 'unit'} serves an item only if the item needs it; a change that is merely nearby, or a tidy-up nobody asked for, serves nothing. List an out-of-scope item (O...) only if the ${mode === 'per-hunk' ? 'hunk' : 'unit'} does what that item excludes. Leave the list empty if it serves nothing. Only the goal, the requester's words (constraints and agreed extras) or an approved decision make a change in scope; the plan's wording does not.
+- When code satisfies an example, check whether it is general or matches only that example's input; code that special-cases the example does not meet it.
+- For each ${mode === 'per-hunk' ? 'hunk' : 'unit'}, also list its extras: each thing it changes that no item needs, even when the rest of it serves an item. Renaming, reformatting, rewording or restructuring code the change did not need is an extra; so is any behaviour no item asks for. For each extra, give the hunks it is in, and the item it sits next to, or none. New code that the change needs, with comments and docstrings that explain it, is not an extra. In extras and notes, refer to items in words ("the fourth decision"), never by their codes.\n\nThe approved spec:\n${specView}\n\n${mode === 'per-hunk' ? '' : `The units:\n${unitView}\n\n`}The change:\n\n${diffView}` }
+
+// The builder's log was relayed with the git facts from committed HEAD (section 7.1); this step
+// is the first and only one that sees it (ADR-005).
+const build = parseBuild(buildText, spec)
+if (build.errors.length) return await fail('build', 'the builder log at HEAD does not meet its format', { build_errors: build.errors })
+const devIds = build.deviations.map(d => d.id), claimIds = build.claims.map(c => c.id), decisionIds = build.decisions.map(d => d.id)
+let claims = { deviations: [], claims: [], decision_conflicts: [] }
+if (plan.unplannedHunks.length || claimIds.length || decisionIds.length) {
+  const logView = JSON.stringify({ deviations: build.deviations, decisions: build.decisions, claims: build.claims }, null, 2)
+  const r = await judge('claims', 'high', `You are the last step of the check. Below is the builder's own log, as committed. Verify it; do not trust it.\n\n1. For each hunk outside the plan (${plan.unplannedHunks.join(', ') || 'none'}): the id of the logged deviation, or of the logged decision, that explains it, and the plan step it departs from; null for both if nothing logged explains it. A decision explains a hunk only if it names this place or what was put there, not merely the same topic.\n2. For each logged claim, by its id: supported or contradicted by the change and the verdicts below, or unverifiable when the change cannot show it either way (a test run, a timing, behaviour outside the diff), with one line of evidence. The evidence is shown to people: name code by file, line and function, and the spec's items in words, never by an id such as a hunk, step or item code.\n3. For each logged decision: list it only if it conflicts with a decision (D...) or constraint (C...) of the approved spec.\n\nThe builder's log:\n${logView}\n\nThe approved spec:\n${specView}\n\nVerdicts already fixed (do not change them):\nplan adherence: ${JSON.stringify(adherence.steps)}\nspec mapping: ${JSON.stringify(mapping.items)}\nconstraints: ${JSON.stringify(mapping.constraints)}\n\nThe change:\n\n${diffView}`,
+    CLAIMS(plan.unplannedHunks, devIds, spec.plan.steps.map(x => x.id), claimIds, decisionIds, [...spec.decisions.map(d => d.id), ...cIds]),
+    x => claimsCoverage(plan.unplannedHunks, claimIds, x))
+  if (!r.r) return await fail('claims', 'the claims judge did not answer for every unplanned hunk and claim', { coverage: r.problems })
+  const text = new Map(build.claims.map(c => [c.id, c.text]))
+  claims = { ...r.r, claims: r.r.claims.map(c => ({ id: c.id, text: text.get(c.id), status: c.status, evidence: c.evidence })) }
 }
 
-phase('Body')
-const repo = githubRepo(f.out.remote)
-const parts = prParts(spec, check, none ? null : reviewLink(repo, sha, change))
-const tpl = findTemplate(f.out.files.split('\n').filter(Boolean))
-let body = prBody(parts)
-if (tpl.path) {
-  const t = await relay('template', [['text', `git show HEAD:${tpl.path}`]])
-  if (t && t.refused) return refusedError(t)
-  if (t && t.out.text.trim()) body = fillTemplate(t.out.text, parts, prFacts(spec, log))
-}
-// In mode none the body carries the review; when saving that is refused, the body without it is
-// saved instead and says where the review is (architecture 5.2.1).
-const reduced = none ? body + noneAppendix(null, approval.hashes, `${dir}/review.md`) : null
-if (none) body += noneAppendix(reviewText, approval.hashes)
-const recorded = await recordPage(`${dir}/pr.md`, body, reduced, 'Body')
-if (!recorded) return { change, error: `${dir}/pr.md could not be saved and verified` }
+const result = assemble({
+  change, mode, spec, units, adherence, mapping, claims, plan,
+  head: factsA.out.head.trim(),
+  dirty: factsA.out.status.trim().length > 0,
+  approval: approvals.latest,
+  unapproved: approvals.unapproved,
+})
+result.facts_attempts = { head: factsA.attempts, spec: factsB ? factsB.attempts : null, diff: factsC.attempts }
+result.documents = none ? 'none' : 'committed'
 
-const branch = f.out.branch
-const style = config && config.branch
-return {
-  change,
-  body: `${dir}/pr.md`,
-  body_complete: recorded === 'full',
-  title: prTitle(spec),
-  documents: none ? 'none' : 'committed',
-  records_commit: sha,
-  records_committed_now: committed,
-  template: tpl.path,
-  template_note: tpl.note,
-  github: repo,
-  branch: branch || null,
-  // On a default branch, a pull request needs a branch of its own, named by the project's convention.
-  needs_branch: !branch || DEFAULT_BRANCH.test(branch),
-  suggested_branch: style && style.kind === 'prefix' && style.prefix ? `${style.prefix}${change}` : change,
-}
+phase('Record')
+result.recorded = await record(result)
+if (!result.recorded) log('check.json could not be verified after two writes')
+// The review page, generated by code from the spec, the build log and this result: what the
+// skill shows the requester, exactly as written.
+let buildLog = null
+try { buildLog = buildText.trim() ? JSON.parse(buildText) : null } catch (e) { buildLog = null }
+result.review = `.rbb/${change}/review.md`
+// 'full', or 'reduced' (without the reasoning) when the full page's save is refused (architecture 5.2.1).
+result.review_recorded = await recordPage(result.review, reviewPage(spec, buildLog, result), reviewPage(spec, buildLog, result, { reasons: false }), 'Record')
+return result

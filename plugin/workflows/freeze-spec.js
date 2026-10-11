@@ -1,5 +1,5 @@
 export const meta = {
-  name: 'approve',
+  name: 'freeze-spec',
   description: 'RBB: make the approval commit for an approved spec, with the RBB-Approved trailer, and verify it',
   whenToUse: 'Started by the rbb:approve skill after the requester approves; not for direct use.',
   phases: [
@@ -655,7 +655,7 @@ async function recordPage(path, full, reduced, phase) {
 
 // The skill passes {"change": ...}; an agent that passes the argument text itself means its first word.
 const change = typeof args === 'string' ? args.trim().split(/\s+/)[0] : args && args.change
-if (!/^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$/.test(change || '')) throw new Error(`rbb:approve needs a change name, got: ${change}`)
+if (!/^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$/.test(change || '')) throw new Error(`rbb:freeze-spec needs a change name, got: ${change}`)
 const dir = `.rbb/${change}`
 const relay = (label, cmd) => agent(`Run \`${cmd}\` in the current directory and return its standard output verbatim. If it fails or prints nothing, return an empty string.`, { label, phase: 'Check', agentType: 'rbb:checker', effort: 'low', schema: { type: 'object', properties: { out: { type: 'string' } }, required: ['out'] } })
 

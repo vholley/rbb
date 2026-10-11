@@ -1,14 +1,14 @@
 export const meta = {
-  name: 'status',
-  description: 'RBB: where each change stands, worked out by code from its record files and git. Changes nothing.',
-  whenToUse: 'Started by the rbb:status skill; not for direct use.',
+  name: 'clear-records',
+  description: 'RBB: list the records of changes merged into the target branch, and remove the ones the requester confirms in one commit',
+  whenToUse: 'Started by the /rbb:clear skill; not for direct use.',
   phases: [
-    { title: 'Facts', detail: 'git facts and the record files in one read, then the per-change git facts' },
-    { title: 'Derive', detail: 'the stage of each change, by code' },
+    { title: 'Find', detail: 'the target branch, and the records in its tree, relayed from git twice' },
+    { title: 'Clear', detail: 'only with confirmed changes: one commit removing their folders, verified from git' },
   ],
 }
 
-// <pure> -- deterministic functions only; unit-tested by tests/check/unit.mjs with no model.
+// <pure> -- deterministic functions only.
 
 // <lib:spec> copied from src/lib/spec.js by tools/sync-lib.mjs; edit the source, not this copy
 // The goal and spec formats (docs/spec-format.md) and their validation. Pure functions only.
@@ -594,209 +594,147 @@ function commitSubject(prefix, title) {
 }
 // </lib:spec>
 
-// <lib:status> copied from src/lib/status.js by tools/sync-lib.mjs; edit the source, not this copy
-// Where a change stands (architecture 5.5), derived by code from its record files and git facts.
-// Pure functions only. Needs the spec library (goalReady).
+const RELAY_CLEAR = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, { type: 'string', description: `stdout of the command labelled ${k}, verbatim` }])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run; empty if all ran' } }, required: [...keys, 'refused'] })
 
-// facts: { change, documents, files, goal, approved, codeChangedSinceApproval, build, check, head,
-// dirty, codeChangedSinceCheck, pr, mergedInto }. files: the names present in .rbb/<change>/.
-// approved: true when an approval commit exists (committed) or approval.json is valid (none).
-// check: the parsed check.json or null. mergedInto: the target branch the approval is reachable
-// from while another branch is checked out, else null.
-function deriveStatus(f) {
-  const has = name => (f.files || []).includes(name)
-  // The check covers HEAD when no code outside .rbb changed since the checked commit and the tree
-  // is clean: commits that only record (the check, the review) do not make it stale, as in /rbb:pr.
-  const checkCurrent = !!(f.check && f.check.head && f.codeChangedSinceCheck === false && !f.dirty)
-  if (f.mergedInto) return { stage: 'merged', target: f.mergedInto }
-  if (!has('goal.json') && !has('spec.json')) return { stage: 'no goal' }
-  if (!has('spec.json')) {
-    const open = f.goal && Array.isArray(f.goal.questions) ? f.goal.questions.length : null
-    return f.goal && goalReady(f.goal) ? { stage: 'goal ready' } : { stage: 'goal', open }
-  }
-  if (!f.approved) return { stage: 'drafted' }
-  if (!f.codeChangedSinceApproval && !has('build.json')) return { stage: 'approved' }
-  if (!has('build.json')) return { stage: 'changed' }
-  if (!f.check) return { stage: 'built' }
-  if (!checkCurrent) return { stage: 'stale' }
-  if (f.check.verdict === 'error') return { stage: 'check failed', reason: f.check.error && f.check.error.reason }
-  const differences = (f.check.exceptions || []).length
-  const forPerson = (f.check.for_a_person || []).length
-  return { stage: has('pr.md') ? 'pr ready' : 'checked', differences, forPerson }
+// The branch changes are merged into: the one asked for; else the remote's default; else the current
+// branch when it is a default name; else main or master, whichever exists.
+function pickTarget(asked, originHead, current, locals) {
+  if (asked) return asked
+  const remote = String(originHead || '').trim().replace(/^origin\//, '')
+  if (remote) return remote
+  if (/^(main|master|develop|trunk)$/.test(current || '')) return current
+  return ['main', 'master'].find(b => locals.includes(b)) || null
 }
 
-// One line per change, in the old RBB's voice: where it stands, then what comes next.
-function statusLine(change, s, f) {
-  const n = (k, one, many) => `${k} ${k === 1 ? one : many}`
-  const counts = s => [s.differences ? n(s.differences, 'difference from the spec', 'differences from the spec') : 'no differences from the spec', s.forPerson ? n(s.forPerson, 'statement for a person to confirm', 'statements for a person to confirm') : ''].filter(Boolean).join(', ')
-  const text = {
-    'no goal': () => 'a folder with no goal or spec. /rbb:goal starts a change.',
-    goal: () => `shaping the goal${s.open ? `; ${n(s.open, 'open question', 'open questions')}` : ''}. /rbb:goal is next.`,
-    'goal ready': () => 'goal ready; no spec yet. /rbb:approve drafts it next.',
-    drafted: () => 'spec drafted, not approved. /rbb:approve is next.',
-    approved: () => 'approved, not built yet. /rbb:build is next.',
-    changed: () => 'the code changed since the approval, with no build log. /rbb:check measures the change as it is.',
-    built: () => 'built, not checked. /rbb:check is next.',
-    stale: () => 'built. Not checked since the last change. /rbb:check is next.',
-    'check failed': () => `the last check did not complete${s.reason ? ` (${s.reason})` : ''}. /rbb:check again.`,
-    checked: () => `checked: ${counts(s)}. /rbb:pr is next.`,
-    'pr ready': () => `checked: ${counts(s)}. The pull request body is written; /rbb:pr ${change} post opens it.`,
-    merged: () => `merged into ${s.target}; its records await /rbb:clear.`,
-  }[s.stage]()
-  const dirty = f && f.dirty && !['merged', 'no goal', 'goal', 'goal ready', 'drafted'].includes(s.stage) ? ' The working tree has uncommitted changes outside .rbb.' : ''
-  return `${change}: ${text}${dirty}`
-}
-// </lib:status>
-
-// The changes with a folder under .rbb/, from the file lists git gives (tracked and untracked, then
-// ignored, for mode none), each with the names of its files.
-function changeFolders(lists) {
-  const by = new Map()
-  for (const f of lists.flatMap(l => String(l || '').split('\n')).map(x => x.trim()).filter(Boolean)) {
-    const m = /^\.rbb\/([^/]+)\/([^/]+)$/.exec(f)
+// Each change folder in the target's tree that holds a spec: a record of a change that reached it,
+// whatever the merge strategy (architecture section 9). config.json is not a change.
+// In mode none (needSpec false) every local change folder is listed, a failed run's leftovers too.
+function recordsInTree(files, needSpec = true) {
+  const byChange = new Map()
+  for (const f of files.map(x => x.trim()).filter(Boolean)) {
+    const m = /^\.rbb\/([^/]+)\/(.+)$/.exec(f)
     if (!m) continue
-    if (!by.has(m[1])) by.set(m[1], new Set())
-    by.get(m[1]).add(m[2])
+    if (!byChange.has(m[1])) byChange.set(m[1], [])
+    byChange.get(m[1]).push(m[2])
   }
-  return [...by].sort(([a], [b]) => a.localeCompare(b)).map(([change, files]) => ({ change, files: [...files].sort() }))
+  return [...byChange].filter(([, fs]) => !needSpec || fs.includes('spec.json')).map(([change, fs]) => ({ change, files: fs.sort() }))
 }
 
-// The branch changes are merged into: origin's HEAD, else the first usual name that exists.
-function targetBranch(originHead, locals) {
-  const o = String(originHead || '').trim().replace(/^origin\//, '')
-  if (o) return o
-  const names = String(locals || '').split('\n').map(s => s.replace(/^[*+]?\s*/, '').trim()).filter(Boolean)
-  return ['main', 'master', 'develop', 'trunk'].find(n => names.includes(n)) || null
+function clearSubject(style, changes) {
+  const what = `RBB records of ${changes.length === 1 ? changes[0] : `${changes.length} merged changes`}`
+  return style && style.kind === 'conventional' ? commitSubject(`${style.type === 'docs' ? 'chore' : (style.type || 'chore')}: clear `, what) : commitSubject('Clear ', what)
 }
 
-// tail -v -n +1 <files> prints each file under a "==> path <==" header: the files by path.
-function splitTail(text) {
-  const out = {}
-  let cur = null
-  for (const line of String(text || '').split('\n')) {
-    const m = /^==> (.+) <==$/.exec(line)
-    if (m) { cur = m[1].replace(/\\/g, '/').replace(/^\.\//, ''); out[cur] = []; continue }
-    if (cur !== null) out[cur].push(line)
-  }
-  return Object.fromEntries(Object.entries(out).map(([k, v]) => [k, v.join('\n').trim()]))
-}
-
-// grep -H prefixes each line with the file: "path:rest". Lines by path.
-function byFile(text) {
-  const out = {}
-  for (const line of String(text || '').split('\n')) {
-    const m = /^(\.rbb\/[^:]+):(.*)$/.exec(line.replace(/\\/g, '/'))
-    if (!m) continue
-    ;(out[m[1]] = out[m[1]] || []).push(m[2])
-  }
-  return out
-}
-// What the status needs from a check.json, taken by grep on the file as the recorder writes it
-// (JSON.stringify with two-space indents): the checked commit, the verdict, the counts of exceptions
-// and of statements for a person, and the error reason. A check that the greps do not find is absent.
-function checkFacts(path, scalars, kinds, whys, reasons) {
-  const field = (lines, name) => { const m = (lines || []).map(l => new RegExp(`^\\s*"${name}":\\s*"([^"]*)"`).exec(l)).find(Boolean); return m ? m[1] : null }
-  const head = field(scalars[path], 'head'), verdict = field(scalars[path], 'verdict')
-  if (!head && !verdict) return null
-  const count = lines => Number(((lines || [])[0] || '0').trim()) || 0
-  const reason = field(reasons[path], 'reason')
-  return { head, verdict, exceptions: new Array(count(kinds[path])).fill({}), for_a_person: new Array(count(whys[path])).fill({}), ...(reason ? { error: { reason } } : {}) }
+function clearCommands(changes, subject) {
+  const dirs = changes.map(c => `.rbb/${c}`).join(' ')
+  return [
+    `git rm -r -q -- ${dirs}`,
+    `git commit -m "${subject}" -m "Merged; the records stay in the pull requests and in history." -- ${dirs}`,
+    // Untracked leftovers in those folders, such as the pull request body; only the paths named.
+    `git clean -f -q -- ${changes.map(c => `.rbb/${c}/`).join(' ')}`,
+  ]
 }
 
 // </pure>
 
-// The skill passes {"change": ...}; an agent that passes the argument text itself means its first word.
-const only = typeof args === 'string' ? args.trim().split(/\s+/)[0] || null : (args && args.change) || null
-if (only && !/^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$/.test(only)) return { error: `not a change name: ${only}` }
-const SHA = /^[0-9a-f]{40}$/
+// The skill passes {"target": ...}; an agent that passes the argument text itself means the target.
+const asked = typeof args === 'string' ? { target: args.trim().split(/\s+/)[0] || undefined } : args || {}
+const SAFE = /^[A-Za-z0-9._\/-]+$/
 
-// Status changes nothing, so each relay is one agent, not two compared (architecture 5.5).
-const RELAY = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, { type: 'string', description: `stdout of the command labelled ${k}, verbatim` }])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run; empty if all ran' } }, required: [...keys, 'refused'] })
 async function relay(label, cmds) {
+  // Nothing to run (no records to ask about): nothing to relay, and no schema with an empty enum.
   if (!cmds.length) return { out: {} }
   const keys = cmds.map(([k]) => k)
-  const prompt = `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label: every character and newline, nothing added, removed or summarised. Return a command's standard output even when it also reports an error, such as one missing file among several: an empty string only when it printed nothing to standard output. If you were not allowed to run a command, return an empty string and list its label under refused.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
+  const prompt = `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label. If a command prints nothing, or fails, return an empty string for it. If you were not allowed to run a command, return an empty string and list its label under refused.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const a = await agent(prompt, { label: `${label} ${attempt}`, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: RELAY(keys) })
-    if (a && a.refused && a.refused.length) return { refused: a.refused.map(k => cmds.find(([l]) => l === k)[1]) }
-    if (a) return { out: Object.fromEntries(keys.map(k => [k, String(a[k] || '').replace(/\s+$/, '')])) }
+    const [a, b] = await parallel([1, 2].map(i => () => agent(prompt, { label: `${label} ${attempt}.${i}`, phase: 'Find', agentType: 'rbb:checker', effort: 'low', schema: RELAY_CLEAR(keys) })))
+    const refused = [...new Set([...((a && a.refused) || []), ...((b && b.refused) || [])])]
+    if (refused.length) return { refused: refused.map(k => cmds.find(([l]) => l === k)[1]) }
+    if (a && b && keys.every(k => String(a[k]).trim() === String(b[k]).trim())) return { out: Object.fromEntries(keys.map(k => [k, String(a[k]).replace(/\s+$/, '')])) }
   }
   return null
 }
 const refusedError = r => ({ error: `these read-only commands were not allowed to run; allow them and try again: ${r.refused.join(' ; ')}` })
-const parse = t => { try { return t && String(t).trim() ? JSON.parse(t) : null } catch (e) { return null } }
 
-phase('Facts')
-// One relay for the git facts and what the record files say about the stage: the config, each goal
-// (its open questions), each approval in mode none, and five facts from each check.
-const f = await relay('facts', [
-  ['head', 'git rev-parse HEAD'],
-  ['branch', 'git branch --show-current'],
+phase('Find')
+if (asked.target && !SAFE.test(asked.target)) return { error: 'the target branch name has characters RBB will not pass to git' }
+const f = await relay('branches', [
+  ['current', 'git branch --show-current'],
   ['origin_head', 'git symbolic-ref --quiet --short refs/remotes/origin/HEAD'],
   ['locals', 'git branch --list main master develop trunk'],
-  ['status', `git status --porcelain=v1 -uall -- . ':(exclude).rbb'`],
-  ['files', 'git -c core.quotepath=false ls-files --cached --others --exclude-standard -- .rbb/'],
-  ['ignored', 'git -c core.quotepath=false ls-files --others --ignored --exclude-standard -- .rbb/'],
-  ['log', `git log --format='%H %(trailers:key=RBB-Approved,valueonly,separator=%x2C)' -- .rbb/`],
-  ['records', 'tail -v -n +1 .rbb/config.json .rbb/*/goal.json .rbb/*/approval.json'],
-  // From each check.json, only what the stage needs, without printing the file.
-  ['check_scalars', `grep -H -o '^  "\\(head\\|verdict\\)": *"[^"]*"' .rbb/*/check.json`],
-  ['check_kinds', `grep -c -H '^      "kind":' .rbb/*/check.json`],
-  ['check_whys', `grep -c -H '^      "why":' .rbb/*/check.json`],
-  ['check_reasons', `grep -H -o '^    "reason": *"[^"]*"' .rbb/*/check.json`],
 ])
 if (f && f.refused) return refusedError(f)
-if (f && !f.out.head.trim()) return { error: 'this repository has no commits yet; RBB needs a first commit to measure a change from' }
-if (!f || !SHA.test(f.out.head)) return { error: 'the relay of git facts failed' }
-const texts = splitTail(f.out.records)
-const [scalars, kinds, whys, reasons] = [f.out.check_scalars, f.out.check_kinds, f.out.check_whys, f.out.check_reasons].map(byFile)
-const documents = documentsMode(parse(texts['.rbb/config.json']))
-const folders = changeFolders([f.out.files, f.out.ignored]).filter(x => !only || x.change === only)
-if (!folders.length) return { head: f.out.head, branch: f.out.branch || null, documents, changes: [], lines: [], note: only ? `no records for ${only}` : 'no RBB change in this repository' }
-const target = targetBranch(f.out.origin_head, f.out.locals)
-const dirty = !!f.out.status
+if (!f) return { error: 'the two relays of the branches disagreed or failed' }
+const target = pickTarget(asked.target, f.out.origin_head, f.out.current, f.out.locals.split('\n').map(s => s.replace(/^[*+]?\s*/, '').trim()))
+if (!target || !SAFE.test(target)) return { error: 'could not tell which branch changes are merged into; name it: /rbb:clear <target>' }
 
-const per = folders.map(x => {
-  const file = name => parse(texts[`.rbb/${x.change}/${name}`])
-  const goal = x.files.includes('goal.json') && !x.files.includes('spec.json') ? file('goal.json') : null
-  const approval = documents === 'none' ? file('approval.json') : null
-  const check = checkFacts(`.rbb/${x.change}/check.json`, scalars, kinds, whys, reasons)
-  const approvalCommit = documents === 'none' ? null : parseLog(f.out.log, x.change).latest
-  const approvedNone = documents === 'none' && approval && !approvalProblems(approval, x.change).length
-  // The commit the build is measured from: the approval commit, or in mode none the explored base.
-  const since = approvalCommit || (approvedNone ? approval.base : null)
-  return { ...x, goal, approval, check, approvalCommit, approved: !!(approvalCommit || approvedNone), since }
-})
+// Mode none (architecture 9.1): the records are local, ignored files and never reached the target.
+// The requester says which changes are done; their folders are deleted, with no commit.
+const cfgNone = await agent('Read the file .rbb/config.json and return its content verbatim, without line numbers. If it does not exist, return an empty string.', { label: 'read config', phase: 'Find', agentType: 'rbb:checker', effort: 'low', schema: { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] } })
+let modeConfig = null
+try { modeConfig = cfgNone && cfgNone.content.trim() ? JSON.parse(cfgNone.content) : null } catch (e) { modeConfig = null }
+if (documentsMode(modeConfig) === 'none') {
+  const local = await relay('local records', [['files', `git -c core.quotepath=false ls-files --others --ignored --exclude-standard -- .rbb/`]])
+  if (local && local.refused) return refusedError(local)
+  if (!local) return { error: 'the two relays of the local records disagreed or failed' }
+  const found = recordsInTree(local.out.files.split('\n'), false)
+  if (!Array.isArray(asked.clear)) return { documents: 'none', target, records: found.map(r => ({ change: r.change, files: r.files })) }
+  const gone = asked.clear.filter(c => found.some(r => r.change === c))
+  if (!gone.length) return { documents: 'none', error: 'none of the confirmed changes has local records', records: found }
+  phase('Clear')
+  // -x: the files are ignored; only the folders named.
+  await agent(`Run this command:\n1. git clean -f -x -q -- ${gone.map(c => `.rbb/${c}/`).join(' ')}`, { label: 'delete local records', phase: 'Clear', agentType: 'rbb:committer', effort: 'low' })
+  const after = await relay('verify', [['files', `git -c core.quotepath=false ls-files --others --ignored --exclude-standard -- ${gone.map(c => `.rbb/${c}/`).join(' ')}`]])
+  if (after && after.refused) return refusedError(after)
+  return after && !after.out.files
+    ? { documents: 'none', cleared: gone, kept: found.map(r => r.change).filter(c => !gone.includes(c)) }
+    : { documents: 'none', error: 'the local records were not all deleted', left: after && after.out.files }
+}
 
-// Git, per change: whether the code moved since the approval and since the check, and whether the
-// approval is reachable from the target while another branch is checked out.
-const cmds = per.flatMap((x, i) => [
-  ...(x.since ? [[`c${i}_since`, `git -c core.quotepath=false diff --name-only ${x.since} HEAD -- . ':(exclude).rbb'`]] : []),
-  ...(x.check && SHA.test(x.check.head || '') ? [[`c${i}_kind`, `git cat-file -t ${x.check.head}`], [`c${i}_check`, `git -c core.quotepath=false diff --name-only ${x.check.head} HEAD -- . ':(exclude).rbb'`]] : []),
-  // Merged means reachable from the target as the remote has it, when the remote has that branch:
-  // the local target may hold commits that were never pushed.
-  ...(x.approvalCommit && target && f.out.branch !== target ? [
-    [`c${i}_remote`, `git branch -r --list origin/${target}`],
-    [`c${i}_merged_remote`, `git branch -r --list origin/${target} --contains ${x.approvalCommit}`],
-    [`c${i}_merged_local`, `git branch --list ${target} --contains ${x.approvalCommit}`],
-  ] : []),
+const t = await relay('records', [
+  ['files', `git -c core.quotepath=false ls-tree -r --name-only ${target} -- .rbb/`],
+  ['status', 'git status --porcelain=v1 -uall'],
 ])
-const g = await relay('changes', cmds)
-if (g && g.refused) return refusedError(g)
-if (!g) return { error: 'the relay of the changes\' git facts failed' }
+if (t && t.refused) return refusedError(t)
+if (!t) return { error: 'the two relays of the records disagreed or failed' }
+const records = recordsInTree(t.out.files.split('\n'))
 
-phase('Derive')
-const changes = per.map((x, i) => {
-  const o = k => g.out[`c${i}_${k}`]
-  const mergedOut = o('remote') && o('remote').trim() ? o('merged_remote') : o('merged_local')
-  const facts = {
-    change: x.change, documents, files: x.files, goal: x.goal, approved: x.approved,
-    codeChangedSinceApproval: x.since ? !!o('since') : null,
-    check: x.check, head: f.out.head, dirty,
-    codeChangedSinceCheck: x.check && o('kind') === 'commit' ? !!o('check') : null,
-    mergedInto: mergedOut && mergedOut.trim() ? target : null,
-  }
-  const s = deriveStatus(facts)
-  return { change: x.change, stage: s.stage, line: statusLine(x.change, s, facts), approval: x.approvalCommit || (x.approved ? 'hashes' : null), check_head: x.check ? x.check.head || null : null }
-})
-return { head: f.out.head, branch: f.out.branch || null, target, documents, dirty, changes, lines: changes.map(c => c.line) }
+// How each change reached the target, for the requester: its approval commit is reachable after a
+// merge commit or a fast-forward; after a squash or rebase only the files are.
+const how = await relay('merged', records.map((r, n) => [`r${n}`, `git log ${target} --format=%H --grep="RBB-Approved: ${r.change}" -1`]))
+if (how && how.refused) return refusedError(how)
+const listed = records.map((r, n) => ({ change: r.change, files: r.files, approval_reachable: !!(how && /^[0-9a-f]{40}$/.test(how.out[`r${n}`] || '')) }))
+
+const confirmed = Array.isArray(asked.clear) ? asked.clear : null
+if (!confirmed) return { target, current: f.out.current || null, records: listed, dirty: !!t.out.status }
+
+phase('Clear')
+const known = new Set(listed.map(r => r.change))
+const changes = confirmed.filter(c => known.has(c))
+if (!changes.length) return { target, error: 'none of the confirmed changes has records on the target branch', records: listed }
+if (asked.branch && !SAFE.test(asked.branch)) return { target, error: 'the branch name has characters RBB will not pass to git' }
+// The commit goes on the target, or on a new branch from it; never elsewhere.
+if (!asked.branch && f.out.current !== target) return { target, error: `the clearing commit goes on ${target}, but ${f.out.current || 'a detached HEAD'} is checked out; switch to ${target}, or ask for a new branch` }
+const tracked = t.out.status.split('\n').filter(l => l && !l.startsWith('??'))
+if (tracked.length) return { target, error: 'the working tree has uncommitted changes; commit or stash them first', status: tracked }
+
+const cfg = await agent('Read the file .rbb/config.json and return its content verbatim, without line numbers. If it does not exist, return an empty string.', { label: 'read config', phase: 'Clear', agentType: 'rbb:checker', effort: 'low', schema: { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] } })
+let style = null
+try { style = cfg && cfg.content.trim() ? JSON.parse(cfg.content).commit : null } catch (e) { style = null }
+const subject = clearSubject(style, changes)
+const cmds = [...(asked.branch ? [`git switch -c ${asked.branch} ${target}`] : []), ...clearCommands(changes, subject)]
+await agent(`Run these commands:\n${cmds.map((c, n) => `${n + 1}. ${c}`).join('\n')}`, { label: 'clear', phase: 'Clear', agentType: 'rbb:committer', effort: 'low' })
+
+// Verified from git: the folders are gone from HEAD, nothing else changed, and the subject is ours.
+const v = await relay('verify', [
+  ['left', `git -c core.quotepath=false ls-tree -r --name-only HEAD -- ${changes.map(c => `.rbb/${c}/`).join(' ')}`],
+  ['subject', 'git log -1 --format=%s'],
+  ['touched', 'git -c core.quotepath=false show --name-only --format= HEAD'],
+  ['branch', 'git branch --show-current'],
+])
+if (v && v.refused) return refusedError(v)
+const outside = v ? v.out.touched.split('\n').filter(p => p && !changes.some(c => p.startsWith(`.rbb/${c}/`))) : []
+const ok = v && !v.out.left && v.out.subject === subject && !outside.length
+return ok
+  ? { target, cleared: changes, commit_subject: subject, branch: v.out.branch, kept: listed.map(r => r.change).filter(c => !changes.includes(c)) }
+  : { target, error: 'the clearing commit was not found as expected; check git status and git log', commands: cmds, left: v && v.out.left, outside }

@@ -1,12 +1,10 @@
 export const meta = {
-  name: 'build',
-  description: 'RBB: build an approved change from its frozen spec, save the build log, and commit the build',
-  whenToUse: 'Started by RBB skills after approval; not for direct use.',
+  name: 'shape-goal',
+  description: 'RBB: shape a request into a goal, check it by code, and save it as .rbb/<change>/goal.json and goal.md',
+  whenToUse: 'Started by the rbb:goal skill; not for direct use.',
   phases: [
-    { title: 'Ready', detail: 'the frozen spec from the approval commit, and a clean working tree' },
-    { title: 'Build', detail: 'the builder works from the spec alone and returns its log through a schema' },
-    { title: 'Review', detail: 'an independent agent keeps only the real alternatives of each decision' },
-    { title: 'Commit', detail: 'build.json recorded, the build committed and verified from git' },
+    { title: 'Shape', detail: 'the request, and any answers, become a goal through a schema' },
+    { title: 'Record', detail: 'goal.json and goal.md written and read back' },
   ],
 }
 
@@ -596,158 +594,31 @@ function commitSubject(prefix, title) {
 }
 // </lib:spec>
 
-// <lib:build> copied from src/lib/build.js by tools/sync-lib.mjs; edit the source, not this copy
-// The builder's log (architecture 5.3): its schema, validation and page. Pure functions only.
-// Needs the spec library (copied before this one): ID, KIND, num, refs, oneLine.
+const SLUG = /^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$/
 
-const BUILD_KINDS = ['evidence', 'decision', 'deviation', 'claim']
+const GOAL_SCHEMA = { type: 'object', properties: {
+  title: { type: 'string', description: 'one line' },
+  goal: { type: 'string', description: 'the outcome, in observable terms, with no solution in it' },
+  done_when: { type: 'array', minItems: 1, items: { type: 'object', properties: { id: { type: 'string', pattern: '^E[0-9]+$' }, text: { type: 'string', description: 'a concrete input and the expected result' } }, required: ['id', 'text'] } },
+  constraints: { type: 'array', items: { type: 'object', properties: { id: { type: 'string', pattern: '^C[0-9]+$' }, text: { type: 'string' } }, required: ['id', 'text'] } },
+  out_of_scope: { type: 'array', items: { type: 'object', properties: { id: { type: 'string', pattern: '^O[0-9]+$' }, text: { type: 'string' } }, required: ['id', 'text'] } },
+  agreed_extras: { type: 'array', description: 'only what the requester agreed to beyond the request, in an answer', items: { type: 'object', properties: { id: { type: 'string', pattern: '^X[0-9]+$' }, text: { type: 'string' }, why: { type: 'string', description: 'why it is here rather than a follow-up' } }, required: ['id', 'text', 'why'] } },
+  split_off: { type: 'array', description: 'other goals in the same request, each able to be done and reviewed on its own; one line each', items: { type: 'object', properties: { goal: { type: 'string' } }, required: ['goal'] } },
+  questions: { type: 'array', description: 'only what turns on the requester\'s intention and cannot be settled from the request', items: { type: 'object', properties: {
+    question: { type: 'string', description: 'the question, naming the piece of the change it is about' },
+    options: { type: 'array', minItems: 2, description: 'the real answers: each one a way the requester could decide that still meets the request', items: { type: 'object', properties: { option: { type: 'string', description: 'the answer, in a few words' }, means: { type: 'string', description: 'what choosing it would mean for the change, in one sentence' } }, required: ['option', 'means'] } },
+    recommendation: { type: 'string', description: 'one of the options, word for word' },
+    because: { type: 'string', description: 'why that one rather than the others, in terms of the request: what it asks for, what its example shows, what it would leave undone' },
+    affects: { type: 'string', description: 'what the answer changes elsewhere: documentation, other behaviour, a later decision; empty when nothing' },
+  }, required: ['question', 'options', 'recommendation', 'because', 'affects'] } },
+}, required: ['title', 'goal', 'done_when', 'constraints', 'out_of_scope', 'agreed_extras', 'split_off', 'questions'] }
 
-// The log as the builder answers it, through a schema built from the approved spec: it can cite
-// only examples, steps and items that exist.
-function BUILD_SCHEMA(spec) {
-  const eIds = spec.done_when.map(i => i.id)
-  const pIds = spec.plan.steps.map(p => p.id)
-  const itemIds = [...eIds, ...spec.constraints.map(i => i.id), ...spec.out_of_scope.map(i => i.id), ...(spec.agreed_extras || []).map(i => i.id), ...spec.decisions.map(d => d.id)]
-  const s = d => ({ type: 'string', description: d })
-  return { type: 'object', properties: {
-    evidence: { type: 'array', items: { type: 'object', properties: { item: { type: 'string', enum: eIds }, before: s('what the example gave before the change'), after: s('what it gives after'), how: s('the command or check that showed it') }, required: ['item', 'before', 'after', 'how'] } },
-    decisions: { type: 'array', items: { type: 'object', properties: { serves: { type: 'array', items: { type: 'string', enum: itemIds } }, choice: s(''), because: s(''), alternatives: { type: 'array', description: REAL_ALTERNATIVE, items: { type: 'object', properties: { option: s(''), why_not: s('') }, required: ['option', 'why_not'] } }, would_change_if: s('what would make another choice right; empty if nothing would'), basis: { type: 'string', enum: BASES, description: 'the criterion that settled it' } }, required: ['serves', 'choice', 'because', 'alternatives', 'would_change_if', 'basis'] } },
-    deviations: { type: 'array', items: { type: 'object', properties: { step: { type: 'string', enum: pIds }, planned: s('what the plan said'), actual: s('what was done instead'), because: s('') }, required: ['step', 'planned', 'actual', 'because'] } },
-    claims: { type: 'array', items: s('one thing the change does, checkable against the diff') },
-  }, required: ['evidence', 'decisions', 'deviations', 'claims'] }
-}
-
-// The saved log: the builder's answer with ids and who decided stamped by code. The model and
-// effort are the ones the workflow started the builder with, never the builder's own claim.
-function toBuildLog(answer, run) {
-  let n = 0
-  const id = () => `B${++n}`
-  // The model and effort are stamped by code; the basis is the builder's own answer, from a fixed list.
-  const by = { by: 'model', model: run.model, effort: run.effort, ...(run.alias ? { alias: true } : {}) }
-  return { v: 1, entries: [
-    ...answer.evidence.map(e => ({ kind: 'evidence', ...e })),
-    ...answer.decisions.map(({ basis, ...d }) => ({ kind: 'decision', id: id(), ...d, decided_by: { ...by, basis } })),
-    ...answer.deviations.map(d => ({ kind: 'deviation', id: id(), ...d, decided_by: by })),
-    ...answer.claims.map(t => ({ kind: 'claim', text: t })),
-  ] }
-}
-
-// The builder saves its own answer (build.json); what code adds is kept apart in build-meta.json:
-// the model and effort that ran it, and which alternatives the independent review kept (architecture
-// 5.2.1). Readers rebuild the log in memory.
-function composeBuildLog(answer, meta) {
-  const log = toBuildLog(answer, (meta && meta.run) || {})
-  const review = (meta && meta.review) || null
-  let i = -1
-  log.entries = log.entries.map(e => {
-    if (e.kind !== 'decision') return e
-    i++
-    const alts = e.alternatives || []
-    if (!alts.length) return e
-    if (!review) return { ...e, alternatives_reviewed: false }
-    const keep = review.keep[i] || []
-    return { ...e, alternatives: alts.filter((a, j) => keep[j] !== false), alternatives_reviewed_by: review.by }
-  })
-  return log
-}
-
-// The log as text, from build.json and build-meta.json; empty when there is none. A build.json from
-// before the split is a log already.
-function buildLogText(buildText, metaText) {
-  const parse = t => { try { return t && String(t).trim() ? JSON.parse(t) : null } catch (e) { return null } }
-  const b = parse(buildText)
-  if (!b) return String(buildText || '').trim() ? String(buildText) : ''
-  if (Array.isArray(b.entries)) return JSON.stringify(b)
-  return JSON.stringify(composeBuildLog(b, parse(metaText)))
-}
-
-// The log as committed. Empty text means no log. With the spec, references are checked too:
-// evidence names a real example, a deviation a real step, a decision real items.
-// Claims get ids K1, K2, ... in log order so the claims judge answers by id.
-function parseBuild(text, spec) {
-  const empty = { entries: [], claims: [], deviations: [], decisions: [], evidence: [], errors: [] }
-  if (!text.trim()) return empty
-  let b
-  try { b = JSON.parse(text) } catch (e) { return { ...empty, errors: [`build.json is not valid JSON: ${e.message}`] } }
-  const errors = []
-  if (!b || b.v !== 1 || !Array.isArray(b.entries)) return { ...empty, errors: ['build.json: expected {"v": 1, "entries": [...]}'] }
-  const eIds = spec ? new Set(spec.done_when.map(i => i.id)) : null
-  const pIds = spec ? new Set(spec.plan.steps.map(p => p.id)) : null
-  const items = spec ? new Set([...spec.done_when, ...spec.constraints, ...spec.out_of_scope, ...(spec.agreed_extras || []), ...spec.decisions].map(i => i.id)) : null
-  b.entries.forEach((e, n) => {
-    const at = `build.json entries[${n}]`
-    if (!e || !BUILD_KINDS.includes(e.kind)) errors.push(`${at}: kind must be one of ${BUILD_KINDS.join(', ')}`)
-    else if ((e.kind === 'decision' || e.kind === 'deviation') && !/^B\d+$/.test(e.id || '')) errors.push(`${at}: a ${e.kind} needs an id B1, B2, ...`)
-    else if (e.kind === 'claim' && !(typeof e.text === 'string' && e.text.trim())) errors.push(`${at}: a claim needs text`)
-    else if (spec && e.kind === 'evidence' && !eIds.has(e.item)) errors.push(`${at}: evidence for ${e.item}, which is not an example of the spec`)
-    else if (spec && e.kind === 'deviation' && !pIds.has(e.step)) errors.push(`${at}: a deviation from ${e.step}, which is not a step of the plan`)
-    else if (spec && e.kind === 'decision' && Array.isArray(e.serves) && e.serves.some(x => !items.has(x))) errors.push(`${at}: a decision serving an item the spec does not have`)
-  })
-  const bIds = b.entries.filter(e => e && e.id).map(e => e.id)
-  const dup = bIds.filter((x, n) => bIds.indexOf(x) !== n)
-  if (dup.length) errors.push(`build.json: duplicate ids ${[...new Set(dup)].join(', ')}`)
-  const ok = b.entries.filter(e => e && BUILD_KINDS.includes(e.kind))
-  return {
-    entries: ok,
-    claims: ok.filter(e => e.kind === 'claim').map((e, n) => ({ id: `K${n + 1}`, text: e.text })),
-    deviations: ok.filter(e => e.kind === 'deviation'),
-    decisions: ok.filter(e => e.kind === 'decision'),
-    evidence: ok.filter(e => e.kind === 'evidence'),
-    errors,
-  }
-}
-
-// The log as a page for people: examples, steps and decisions named in words, never by code.
-function buildPage(log, spec) {
-  const b = parseBuild(JSON.stringify(log), spec)
-  const parts = ['# Build log']
-  parts.push(`## Evidence for each example\n\n${b.evidence.length ? b.evidence.map(e => `- **Example ${num(e.item)}.** Before: ${oneLine(e.before)}. After: ${oneLine(e.after)}. Shown by: ${oneLine(e.how)}`).join('\n') : 'None recorded.'}`)
-  parts.push(`## Decisions made while building\n\n${b.decisions.length ? b.decisions.map((d, n) => [`### Build decision ${n + 1}: ${oneLine(d.choice)}`, d.serves && d.serves.length ? `- **Serves:** ${refs(d.serves)}` : '', ...decisionLines(d, 'Made while building.')].filter(Boolean).join('\n')).join('\n\n') : 'None.'}`)
-  parts.push(`## Deviations from the plan\n\n${b.deviations.length ? b.deviations.map(d => `- **Step ${num(d.step)}.** Planned: ${oneLine(d.planned)}. Done instead: ${oneLine(d.actual)}. Because: ${oneLine(d.because)}`).join('\n') : 'None.'}`)
-  parts.push(`## What the builder says the change does\n\nThese are the builder's own claims; the check verifies each against the change.\n\n${b.claims.length ? b.claims.map(c => `- ${oneLine(c.text)}`).join('\n') : 'None.'}`)
-  return parts.join('\n\n') + '\n'
-}
-// </lib:build>
-
-// What the builder answers: its log, plus a stop when an example does not behave as the spec
-// expects before the change, plus the kind of change for a conventional commit message.
-const COMMIT_TYPES = ['fix', 'feat', 'refactor', 'docs', 'test', 'perf', 'chore']
-function BUILDER_SCHEMA(spec) {
-  const log = BUILD_SCHEMA(spec)
-  return { ...log, properties: { ...log.properties,
-    stop: { type: ['string', 'null'], description: 'why you stopped without changing anything, or null' },
-    commit_type: { type: 'string', enum: COMMIT_TYPES, description: 'the kind of change, for the commit message' },
-    files_created: { type: 'array', items: { type: 'string' }, description: 'the path of every new file that is part of the change, relative to the repository root; files your runs produced are not part of it' },
-  }, required: [...log.required, 'stop', 'commit_type', 'files_created'] }
-}
-
-// Paths as git prints them: forward slashes, no leading ./, no trailing slash.
-const normPath = f => String(f).replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '')
-// Whether an untracked file is one the builder named, as the file itself or by its new directory.
-const namedBy = (file, created) => created.some(n => file === n || file.startsWith(`${n}/`))
-// git -c core.quotepath=false ls-files --others --exclude-standard -- . ':(exclude).rbb' lists the
-// untracked files outside .rbb, one per line: those the builder did not name as part of the change
-// are left in the tree, uncommitted, and reported. They are never deleted by RBB.
-function strayFiles(untrackedOutput, created) {
-  const named = (created || []).map(normPath)
-  return String(untrackedOutput || '').split('\n').map(l => l.trim()).filter(Boolean).filter(f => !namedBy(f, named))
-}
-
-function buildSubject(spec, style, type) {
-  return commitSubject(style && style.kind === 'conventional' ? `${type}: ` : '', spec.title || spec.change)
-}
-
-// The build's commit: every change to a tracked file outside .rbb (the tree was clean before the
-// build, so every change is the builder's), the new files the builder named as part of the change,
-// and the build log. A file the builder's runs left behind is not staged. Hooks run; nothing is amended.
-function buildCommands(change, subject, created = []) {
-  const quote = f => `'${String(f).replace(/'/g, `'\\''`)}'`
-  return [
-    `git add -u -- . ':(exclude).rbb'`,
-    ...(created.length ? [`git add -- ${created.map(quote).join(' ')}`] : []),
-    `git add -- .rbb/${change}/build.json .rbb/${change}/build-meta.json`,
-    `git commit -m "${subject}"`,
-  ]
+// The saved goal: the shaper's fields, plus what code stamps (version, the request as written).
+function toGoal(draft, request) {
+  const g = { v: 1, title: draft.title, goal: draft.goal, done_when: draft.done_when, constraints: draft.constraints, out_of_scope: draft.out_of_scope, source_request: request, questions: draft.questions }
+  if (draft.agreed_extras && draft.agreed_extras.length) g.agreed_extras = draft.agreed_extras
+  if (draft.split_off && draft.split_off.length) g.split_off = draft.split_off
+  return g
 }
 
 // </pure>
@@ -791,128 +662,46 @@ async function recordPage(path, full, reduced, phase) {
 }
 // </lib:record>
 
-// <lib:alternatives> copied from src/lib/alternatives.js by tools/sync-lib.mjs; edit the source, not this copy
-// Run the independent review of a decision list's alternatives (architecture 5.1.3) and apply it.
-// Uses the workflow global agent; needs the spec library (altIds, ALT_REVIEW_SCHEMA, altReviewPrompt,
-// altReviewProblems, applyAltReview). The reviewer runs at its own fixed model and effort.
-
-const ALT_REVIEWER = { model: 'opus', effort: 'high', alias: true }
-
-async function reviewAlternatives(goal, decisions, phase) {
-  const ids = altIds(decisions)
-  if (!ids.length) return decisions
-  let problems = []
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const prompt = altReviewPrompt(goal, decisions) + (problems.length ? `\n\nYour last answer broke these rules; fix them:\n${problems.join('\n')}` : '')
-    const answer = await agent(prompt, { label: `review alternatives ${attempt}`, phase, agentType: 'rbb:checker', model: ALT_REVIEWER.model, effort: ALT_REVIEWER.effort, schema: ALT_REVIEW_SCHEMA(ids) })
-    problems = answer ? altReviewProblems(ids, answer) : ['no answer']
-    if (!problems.length) return applyAltReview(decisions, answer, ALT_REVIEWER)
-  }
-  return applyAltReview(decisions, null)
-}
-// </lib:alternatives>
-
-// The skill passes {"change": ...}; an agent that passes the argument text itself means its first word.
-const change = typeof args === 'string' ? args.trim().split(/\s+/)[0] : args && args.change
-if (!/^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$/.test(change || '')) throw new Error(`rbb:build needs a change name, got: ${change}`)
-const run = { model: (args && args.model) || 'sonnet', effort: (args && args.effort) || 'medium' }
-run.alias = !/^claude-/.test(run.model)
-const specPath = `.rbb/${change}/spec.json`
-const RELAY = keys => ({ type: 'object', properties: Object.fromEntries(keys.map(k => [k, { type: 'string' }])), required: keys })
-async function relay(label, cmds) {
-  const keys = cmds.map(([k]) => k)
-  const p = `Run these commands in the current directory, exactly as written, and return each one's standard output verbatim under its label; an empty string if it fails or prints nothing.\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
-  const [a, b] = await parallel([1, 2].map(i => () => agent(p, { label: `${label} ${i}`, phase: 'Ready', agentType: 'rbb:checker', effort: 'low', schema: RELAY(keys) })))
-  return a && b && keys.every(k => a[k].trim() === b[k].trim()) ? a : null
-}
-
-phase('Ready')
-const config = await (async () => {
-  const back = await agent('Read the file .rbb/config.json and return its content verbatim, without line numbers. If it does not exist, return an empty string.', { label: 'read config', phase: 'Ready', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })
-  try { return back && back.content.trim() ? JSON.parse(back.content) : null } catch (e) { return null }
-})()
-const none = documentsMode(config) === 'none'
-const f1 = await relay('approval and tree', [
-  ['head', 'git rev-parse HEAD'],
-  ['log', `git log --format='%H %(trailers:key=RBB-Approved,valueonly,separator=%x2C)' -- ${specPath}`],
-  ['status', `git status --porcelain=v1 -uall -- . ':(exclude).rbb'`],
-])
-if (!f1) return { change, error: 'the two relays of git facts disagreed or failed' }
-if (f1.status.trim()) return { change, error: 'the working tree has changes outside .rbb; commit or stash them first, so every change after this point is the build', status: f1.status.trim() }
-// The spec, rebuilt in memory from its manifest and the files it names (architecture 5.2.1).
+// The skill passes {"change", "request"}. An agent that passes the argument text itself has passed
+// the request: the change is then named from its first words, as the skill would name it.
+const nameFromRequest = text => (String(text).toLowerCase().match(/[a-z0-9]+/g) || []).filter(w => w.length > 1).slice(0, 5).join('-').slice(0, 50).replace(/-+$/, '') || 'change'
+const change = typeof args === 'string' ? nameFromRequest(args) : args && args.change
+const request = typeof args === 'string' ? args : args && args.request
+const answers = (args && Array.isArray(args.answers)) ? args.answers : []
+if (!SLUG.test(change || '')) throw new Error(`rbb:shape-goal needs a change name of lowercase words joined by hyphens, got: ${change}`)
+if (!(typeof request === 'string' && request.trim())) throw new Error('rbb:shape-goal needs the request')
 const dir = `.rbb/${change}`
-const readText = async (file, label) => { const b = await agent(`Read the file ${file} and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label, phase: 'Ready', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA }); return b ? b.content : '' }
-let spec = null
-if (none) {
-  // Mode none (architecture 9.1): the files on this machine, accepted only if each has its approved hash.
-  let approval = null
-  try { approval = JSON.parse(await readText(`${dir}/approval.json`, 'read approval')) } catch (e) { approval = null }
-  if (approvalProblems(approval, change).length) return { change, error: `no valid approval for ${change}; approve the spec first`, problems: approvalProblems(approval, change) }
-  const h = await relay('spec hashes', [['hashes', `git hash-object ${hashedFiles(approval).map(f => `${dir}/${f}`).join(' ')}`]])
-  const changed = h ? changedSpecFiles(approval, h.hashes) : hashedFiles(approval)
-  if (changed.length) return { change, error: `the spec changed after it was approved (${changed.join(', ')}); approve it again` }
-  const texts = await parallel(SPEC_FILES.map(f => () => readText(`${dir}/${f}`, `read ${f}`)))
-  const built = specFromTexts(change, Object.fromEntries(SPEC_FILES.map((f, n) => [f, texts[n]])))
-  spec = built.spec
-  if (!spec || validateSpec(spec, change).length || spec.base !== approval.base) return { change, error: `the approved spec could not be read, or does not meet its format${built.error ? `: ${built.error}` : ''}` }
-} else {
-  const approvals = parseLog(f1.log, change)
-  if (!approvals.latest) return { change, error: `no approval commit for ${change}; approve the spec first` }
-  const f2 = await relay('frozen spec', SPEC_FILES.map((f, n) => [`f${n}`, `git show ${approvals.latest}:${dir}/${f}`]))
-  const built = f2 ? specFromTexts(change, Object.fromEntries(SPEC_FILES.map((f, n) => [f, f2[`f${n}`]]))) : { error: 'the relays of the spec disagreed' }
-  spec = built.spec
-  if (!spec || validateSpec(spec, change).length) return { change, error: `the approved spec could not be read from its approval commit, or does not meet its format${built.error ? `: ${built.error}` : ''}` }
+
+phase('Shape')
+let previous = null
+if (answers.length) {
+  const back = await agent(`Read the file ${dir}/goal.json and return its content verbatim, without line numbers.`, { label: 'read previous goal', phase: 'Shape', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })
+  try { previous = back && JSON.parse(back.content) } catch (e) { previous = null }
+  if (!previous) throw new Error(`answers were given but ${dir}/goal.json could not be read`)
 }
 
-phase('Build')
-let answer = null, problems = []
-for (let attempt = 1; attempt <= 2 && !answer; attempt++) {
-  // A retry only corrects the log: the change is already made, and building again would stack edits.
-  const prompt = attempt === 1
-    ? `Build this approved change in the current repository. When you are done, run git diff and check every claim and decision of your log against it: the log says only what the diff shows. Then save your log to ${dir}/build.json as described in your instructions, and return the same log.\n\nThe approved spec:\n${JSON.stringify(spec, null, 2)}`
-    : `You have already built this change. Change no file of the project. Save your log again to ${dir}/build.json, corrected for these problems, then return the same log:\n${problems.join('\n')}\n\nThe approved spec:\n${JSON.stringify(spec, null, 2)}`
-  const a = await agent(prompt, { label: `build ${attempt}`, phase: 'Build', agentType: 'rbb:builder', model: run.model, effort: run.effort, schema: BUILDER_SCHEMA(spec) })
-  if (!a) { problems = ['the builder returned nothing']; continue }
-  if (a.stop) return { change, stopped: a.stop, note: 'nothing was committed; review the spec or the example' }
-  const log = toBuildLog(a, run)
-  problems = parseBuild(JSON.stringify(log), spec).errors
-  if (!problems.length) answer = { a, log }
+const task = previous
+  ? `Revise this goal with the requester's answers. When an answer agrees to something beyond the request, record it as an agreed extra (X1, X2...) with why it is here rather than a follow-up. When an answer asks for a change to the spec (the question "What should change in the spec?"), add it to the goal in the requester's own words, never reworded: as a new constraint (C...) when it says what must hold or must not change, as a new example (E...) when it gives an input and a result, as a new exclusion (O...) when it says what not to do; so that the check and the pull request hold it as their request, not as your restatement. Their answers stand; do not ask them again. An answer of "you decide", or bare agreement, means your recommendation. Keep every item that the answers do not change, with its id.\n\nThe goal:\n${JSON.stringify(previous, null, 2)}\n\nThe answers:\n${JSON.stringify(answers, null, 2)}`
+  : `Shape this request into a goal. Number examples E1, E2..., constraints C1..., and exclusions O1....\n\nThe request, as the requester wrote it:\n${request}`
+
+let goal = null, problems = []
+for (let attempt = 1; attempt <= 2 && !goal; attempt++) {
+  const draft = await agent(attempt === 1 ? task : `${task}\n\nYour last draft broke these rules; fix them:\n${problems.join('\n')}`, { label: `shape ${attempt}`, phase: 'Shape', agentType: 'rbb:shaper', effort: 'high', schema: GOAL_SCHEMA })
+  if (!draft) { problems = ['the shaper returned nothing']; continue }
+  const g = toGoal(draft, request)
+  // A new draft's questions must carry their options, reason and effects (strict); the saved goal
+  // is validated leniently, so older goals still read.
+  problems = [...validateGoal(g), ...questionProblems(g.questions)]
+  if (problems.length) continue
+  // Items cited by code: ask once to rephrase; on the second draft accept and note it.
+  const mentions = mentionProblems(g)
+  if (mentions.length && attempt === 1) { problems = mentions; continue }
+  if (mentions.length) log(`kept despite: ${mentions.join('; ')}`)
+  goal = g
 }
-if (!answer) return { change, error: 'the build log did not meet its format', problems }
+if (!goal) return { change, error: 'the goal did not meet its format', problems }
 
-// The builder saved its own log (architecture 5.2.1): read back, it must equal its answer. No retry,
-// since another agent would have to re-type it.
-const savedBack = await readText(`${dir}/build.json`, 'read back build.json')
-let savedLog = null
-try { savedLog = savedBack.trim() ? JSON.parse(savedBack) : null } catch (e) { savedLog = null }
-if (!savedLog || !sameJson(savedLog, answer.a)) return { change, error: `the builder did not save ${dir}/build.json, or saved something other than its log; nothing was committed` }
-
-// An agent that saw neither the builder's conversation nor its reasons judges each alternative. Its
-// verdicts reach the record only as keep or drop, in build-meta.json, with the stamps code adds.
-phase('Review')
-const runStamp = { model: run.model, effort: run.effort, ...(run.alias ? { alias: true } : {}) }
-const pre = composeBuildLog(answer.a, { run: runStamp }).entries.filter(e => e.kind === 'decision')
-const reviewed = await reviewAlternatives(spec, pre, 'Review')
-const done = reviewed.some(d => d.alternatives_reviewed_by)
-const review = pre.some(d => (d.alternatives || []).length) && done ? { by: ALT_REVIEWER, keep: pre.map((d, i) => (d.alternatives || []).map(a => reviewed[i].alternatives.includes(a))) } : null
-const buildMeta = { v: 1, run: runStamp, review }
-
-phase('Commit')
-const style = config && config.commit
-const recorded = await recordFile(`${dir}/build-meta.json`, JSON.stringify(buildMeta, null, 2) + '\n', 'Commit', t => { try { return sameJson(JSON.parse(t), buildMeta) } catch (e) { return false } })
-if (!recorded) return { change, error: 'build-meta.json could not be saved and verified; nothing was committed' }
-const subject = buildSubject(spec, style, answer.a.commit_type)
-// New files the builder named are committed; any other untracked file outside .rbb is a leftover
-// of its runs: left in the tree and reported, never deleted.
-const untracked = await relay('untracked', [['files', `git -c core.quotepath=false ls-files --others --exclude-standard -- . ':(exclude).rbb'`]])
-if (!untracked) return { change, error: 'the two relays of the untracked files disagreed or failed; nothing was committed' }
-const allUntracked = strayFiles(untracked.files, [])
-// Only names that match an untracked file or directory are staged, so a mistaken name cannot fail git add.
-const created = (answer.a.files_created || []).map(normPath).filter(f => allUntracked.some(u => namedBy(u, [f])))
-const stray = strayFiles(untracked.files, created)
-const cmds = buildCommands(change, subject, created).filter(c => !(none && c.includes('build.json')))
-await agent(`Run these commands:\n${cmds.map((c, n) => `${n + 1}. ${c}`).join('\n')}`, { label: 'commit', phase: 'Commit', agentType: 'rbb:committer', effort: 'low' })
-const v = await relay('verify', [['last', "git log -1 --format='%H %P'"], ['files', 'git show --name-only --format= HEAD']])
-const [sha, parent] = v ? v.last.trim().split(/\s+/) : []
-if (!v || parent !== f1.head.trim()) return { change, error: 'the build commit was not found on top of the approval; check git status', commands: cmds }
-return { change, built: true, commit: sha, subject, files: v.files.trim().split('\n'), decisions: answer.a.decisions.length, deviations: answer.a.deviations.length, ...(stray.length ? { left_untracked: stray, note: 'files the build left in the tree and did not commit; delete them, or add them to the change yourself' } : {}) }
+phase('Record')
+const savedJson = await recordFile(`${dir}/goal.json`, JSON.stringify(goal, null, 2) + '\n', 'Record', t => { try { return JSON.stringify(JSON.parse(t)) === JSON.stringify(goal) } catch (e) { return false } })
+const savedPage = await recordFile(`${dir}/goal.md`, goalPage(goal), 'Record')
+return { change, ready: goalReady(goal), questions: goal.questions, files: [`${dir}/goal.json`, `${dir}/goal.md`], recorded: !!(savedJson && savedPage) }

@@ -1,10 +1,10 @@
 export const meta = {
-  name: 'goal',
-  description: 'RBB: shape a request into a goal, check it by code, and save it as .rbb/<change>/goal.json and goal.md',
-  whenToUse: 'Started by the rbb:goal skill; not for direct use.',
+  name: 'derive-status',
+  description: 'RBB: where each change stands, worked out by code from its record files and git. Changes nothing.',
+  whenToUse: 'Started by the rbb:status skill; not for direct use.',
   phases: [
-    { title: 'Shape', detail: 'the request, and any answers, become a goal through a schema' },
-    { title: 'Record', detail: 'goal.json and goal.md written and read back' },
+    { title: 'Facts', detail: 'git facts and the record files in one read, then the per-change git facts' },
+    { title: 'Derive', detail: 'the stage of each change, by code' },
   ],
 }
 
@@ -594,114 +594,209 @@ function commitSubject(prefix, title) {
 }
 // </lib:spec>
 
-const SLUG = /^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$/
+// <lib:status> copied from src/lib/status.js by tools/sync-lib.mjs; edit the source, not this copy
+// Where a change stands (architecture 5.5), derived by code from its record files and git facts.
+// Pure functions only. Needs the spec library (goalReady).
 
-const GOAL_SCHEMA = { type: 'object', properties: {
-  title: { type: 'string', description: 'one line' },
-  goal: { type: 'string', description: 'the outcome, in observable terms, with no solution in it' },
-  done_when: { type: 'array', minItems: 1, items: { type: 'object', properties: { id: { type: 'string', pattern: '^E[0-9]+$' }, text: { type: 'string', description: 'a concrete input and the expected result' } }, required: ['id', 'text'] } },
-  constraints: { type: 'array', items: { type: 'object', properties: { id: { type: 'string', pattern: '^C[0-9]+$' }, text: { type: 'string' } }, required: ['id', 'text'] } },
-  out_of_scope: { type: 'array', items: { type: 'object', properties: { id: { type: 'string', pattern: '^O[0-9]+$' }, text: { type: 'string' } }, required: ['id', 'text'] } },
-  agreed_extras: { type: 'array', description: 'only what the requester agreed to beyond the request, in an answer', items: { type: 'object', properties: { id: { type: 'string', pattern: '^X[0-9]+$' }, text: { type: 'string' }, why: { type: 'string', description: 'why it is here rather than a follow-up' } }, required: ['id', 'text', 'why'] } },
-  split_off: { type: 'array', description: 'other goals in the same request, each able to be done and reviewed on its own; one line each', items: { type: 'object', properties: { goal: { type: 'string' } }, required: ['goal'] } },
-  questions: { type: 'array', description: 'only what turns on the requester\'s intention and cannot be settled from the request', items: { type: 'object', properties: {
-    question: { type: 'string', description: 'the question, naming the piece of the change it is about' },
-    options: { type: 'array', minItems: 2, description: 'the real answers: each one a way the requester could decide that still meets the request', items: { type: 'object', properties: { option: { type: 'string', description: 'the answer, in a few words' }, means: { type: 'string', description: 'what choosing it would mean for the change, in one sentence' } }, required: ['option', 'means'] } },
-    recommendation: { type: 'string', description: 'one of the options, word for word' },
-    because: { type: 'string', description: 'why that one rather than the others, in terms of the request: what it asks for, what its example shows, what it would leave undone' },
-    affects: { type: 'string', description: 'what the answer changes elsewhere: documentation, other behaviour, a later decision; empty when nothing' },
-  }, required: ['question', 'options', 'recommendation', 'because', 'affects'] } },
-}, required: ['title', 'goal', 'done_when', 'constraints', 'out_of_scope', 'agreed_extras', 'split_off', 'questions'] }
+// facts: { change, documents, files, goal, approved, codeChangedSinceApproval, build, check, head,
+// dirty, codeChangedSinceCheck, pr, mergedInto }. files: the names present in .rbb/<change>/.
+// approved: true when an approval commit exists (committed) or approval.json is valid (none).
+// check: the parsed check.json or null. mergedInto: the target branch the approval is reachable
+// from while another branch is checked out, else null.
+function deriveStatus(f) {
+  const has = name => (f.files || []).includes(name)
+  // The check covers HEAD when no code outside .rbb changed since the checked commit and the tree
+  // is clean: commits that only record (the check, the review) do not make it stale, as in /rbb:pr.
+  const checkCurrent = !!(f.check && f.check.head && f.codeChangedSinceCheck === false && !f.dirty)
+  if (f.mergedInto) return { stage: 'merged', target: f.mergedInto }
+  if (!has('goal.json') && !has('spec.json')) return { stage: 'no goal' }
+  if (!has('spec.json')) {
+    const open = f.goal && Array.isArray(f.goal.questions) ? f.goal.questions.length : null
+    return f.goal && goalReady(f.goal) ? { stage: 'goal ready' } : { stage: 'goal', open }
+  }
+  if (!f.approved) return { stage: 'drafted' }
+  if (!f.codeChangedSinceApproval && !has('build.json')) return { stage: 'approved' }
+  if (!has('build.json')) return { stage: 'changed' }
+  if (!f.check) return { stage: 'built' }
+  if (!checkCurrent) return { stage: 'stale' }
+  if (f.check.verdict === 'error') return { stage: 'check failed', reason: f.check.error && f.check.error.reason }
+  const differences = (f.check.exceptions || []).length
+  const forPerson = (f.check.for_a_person || []).length
+  return { stage: has('pr.md') ? 'pr ready' : 'checked', differences, forPerson }
+}
 
-// The saved goal: the shaper's fields, plus what code stamps (version, the request as written).
-function toGoal(draft, request) {
-  const g = { v: 1, title: draft.title, goal: draft.goal, done_when: draft.done_when, constraints: draft.constraints, out_of_scope: draft.out_of_scope, source_request: request, questions: draft.questions }
-  if (draft.agreed_extras && draft.agreed_extras.length) g.agreed_extras = draft.agreed_extras
-  if (draft.split_off && draft.split_off.length) g.split_off = draft.split_off
-  return g
+// One line per change, in the old RBB's voice: where it stands, then what comes next.
+function statusLine(change, s, f) {
+  const n = (k, one, many) => `${k} ${k === 1 ? one : many}`
+  const counts = s => [s.differences ? n(s.differences, 'difference from the spec', 'differences from the spec') : 'no differences from the spec', s.forPerson ? n(s.forPerson, 'statement for a person to confirm', 'statements for a person to confirm') : ''].filter(Boolean).join(', ')
+  const text = {
+    'no goal': () => 'a folder with no goal or spec. /rbb:goal starts a change.',
+    goal: () => `shaping the goal${s.open ? `; ${n(s.open, 'open question', 'open questions')}` : ''}. /rbb:goal is next.`,
+    'goal ready': () => 'goal ready; no spec yet. /rbb:approve drafts it next.',
+    drafted: () => 'spec drafted, not approved. /rbb:approve is next.',
+    approved: () => 'approved, not built yet. /rbb:build is next.',
+    changed: () => 'the code changed since the approval, with no build log. /rbb:check measures the change as it is.',
+    built: () => 'built, not checked. /rbb:check is next.',
+    stale: () => 'built. Not checked since the last change. /rbb:check is next.',
+    'check failed': () => `the last check did not complete${s.reason ? ` (${s.reason})` : ''}. /rbb:check again.`,
+    checked: () => `checked: ${counts(s)}. /rbb:pr is next.`,
+    'pr ready': () => `checked: ${counts(s)}. The pull request body is written; /rbb:pr ${change} post opens it.`,
+    merged: () => `merged into ${s.target}; its records await /rbb:clear.`,
+  }[s.stage]()
+  const dirty = f && f.dirty && !['merged', 'no goal', 'goal', 'goal ready', 'drafted'].includes(s.stage) ? ' The working tree has uncommitted changes outside .rbb.' : ''
+  return `${change}: ${text}${dirty}`
+}
+// </lib:status>
+
+// The changes with a folder under .rbb/, from the file lists git gives (tracked and untracked, then
+// ignored, for mode none), each with the names of its files.
+function changeFolders(lists) {
+  const by = new Map()
+  for (const f of lists.flatMap(l => String(l || '').split('\n')).map(x => x.trim()).filter(Boolean)) {
+    const m = /^\.rbb\/([^/]+)\/([^/]+)$/.exec(f)
+    if (!m) continue
+    if (!by.has(m[1])) by.set(m[1], new Set())
+    by.get(m[1]).add(m[2])
+  }
+  return [...by].sort(([a], [b]) => a.localeCompare(b)).map(([change, files]) => ({ change, files: [...files].sort() }))
+}
+
+// The branch changes are merged into: origin's HEAD, else the first usual name that exists.
+function targetBranch(originHead, locals) {
+  const o = String(originHead || '').trim().replace(/^origin\//, '')
+  if (o) return o
+  const names = String(locals || '').split('\n').map(s => s.replace(/^[*+]?\s*/, '').trim()).filter(Boolean)
+  return ['main', 'master', 'develop', 'trunk'].find(n => names.includes(n)) || null
+}
+
+// tail -v -n +1 <files> prints each file under a "==> path <==" header: the files by path.
+function splitTail(text) {
+  const out = {}
+  let cur = null
+  for (const line of String(text || '').split('\n')) {
+    const m = /^==> (.+) <==$/.exec(line)
+    if (m) { cur = m[1].replace(/\\/g, '/').replace(/^\.\//, ''); out[cur] = []; continue }
+    if (cur !== null) out[cur].push(line)
+  }
+  return Object.fromEntries(Object.entries(out).map(([k, v]) => [k, v.join('\n').trim()]))
+}
+
+// grep -H prefixes each line with the file: "path:rest". Lines by path.
+function byFile(text) {
+  const out = {}
+  for (const line of String(text || '').split('\n')) {
+    const m = /^(\.rbb\/[^:]+):(.*)$/.exec(line.replace(/\\/g, '/'))
+    if (!m) continue
+    ;(out[m[1]] = out[m[1]] || []).push(m[2])
+  }
+  return out
+}
+// What the status needs from a check.json, taken by grep on the file as the recorder writes it
+// (JSON.stringify with two-space indents): the checked commit, the verdict, the counts of exceptions
+// and of statements for a person, and the error reason. A check that the greps do not find is absent.
+function checkFacts(path, scalars, kinds, whys, reasons) {
+  const field = (lines, name) => { const m = (lines || []).map(l => new RegExp(`^\\s*"${name}":\\s*"([^"]*)"`).exec(l)).find(Boolean); return m ? m[1] : null }
+  const head = field(scalars[path], 'head'), verdict = field(scalars[path], 'verdict')
+  if (!head && !verdict) return null
+  const count = lines => Number(((lines || [])[0] || '0').trim()) || 0
+  const reason = field(reasons[path], 'reason')
+  return { head, verdict, exceptions: new Array(count(kinds[path])).fill({}), for_a_person: new Array(count(whys[path])).fill({}), ...(reason ? { error: { reason } } : {}) }
 }
 
 // </pure>
 
-// <lib:record> copied from src/lib/record.js by tools/sync-lib.mjs; edit the source, not this copy
-// Save a file from inside a workflow and verify it by reading it back (architecture 5.2).
-// Workflow scripts cannot write files, so the recorder agent (Read and Write) writes, a checker agent
-// reads it back through a schema, and code compares. Uses the workflow globals agent and log.
+// The skill passes {"change": ...}; an agent that passes the argument text itself means its first word.
+const only = typeof args === 'string' ? args.trim().split(/\s+/)[0] || null : (args && args.change) || null
+if (only && !/^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$/.test(only)) return { error: `not a change name: ${only}` }
+const SHA = /^[0-9a-f]{40}$/
 
-const READBACK_SCHEMA = { type: 'object', properties: { content: { type: 'string', description: 'the file content, verbatim' } }, required: ['content'] }
-
-// Text compared line by line, ignoring only trailing spaces and trailing blank lines.
-function sameText(a, b) {
-  const norm = t => String(t).split('\n').map(l => l.replace(/\s+$/, '')).join('\n').replace(/\n+$/, '')
-  return norm(a) === norm(b)
-}
-
-// true when saved and verified; null when the agent saving it ended with an error, which is not
-// retried: when the error is a safeguard refusal, Anthropic's documentation says to change the
-// request rather than retry it, and refusals are billed; false when the read-back never matched.
-async function recordFile(path, text, phase, same = sameText) {
+// Status changes nothing, so each relay is one agent, not two compared (architecture 5.5).
+const RELAY = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, { type: 'string', description: `stdout of the command labelled ${k}, verbatim` }])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run; empty if all ran' } }, required: [...keys, 'refused'] })
+async function relay(label, cmds) {
+  if (!cmds.length) return { out: {} }
+  const keys = cmds.map(([k]) => k)
+  const prompt = `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label: every character and newline, nothing added, removed or summarised. Return a command's standard output even when it also reports an error, such as one missing file among several: an empty string only when it printed nothing to standard output. If you were not allowed to run a command, return an empty string and list its label under refused.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const wrote = await agent(`Write this content to ${path}:\n\n${text}`, { label: `write ${path} (${attempt})`, phase, agentType: 'rbb:recorder', effort: 'low' })
-    if (wrote === null) { log(`${path}: the agent saving it ended with an error (a safeguard refusal, or an API error); not retried`); return null }
-    const back = await agent(`Read the file ${path} and return its content verbatim, without line numbers.`, { label: `read back ${path} (${attempt})`, phase, agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })
-    if (back && same(back.content, text)) return true
-    log(`${path}: read-back did not match (attempt ${attempt})`)
+    const a = await agent(prompt, { label: `${label} ${attempt}`, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: RELAY(keys) })
+    if (a && a.refused && a.refused.length) return { refused: a.refused.map(k => cmds.find(([l]) => l === k)[1]) }
+    if (a) return { out: Object.fromEntries(keys.map(k => [k, String(a[k] || '').replace(/\s+$/, '')])) }
   }
-  return false
+  return null
 }
+const refusedError = r => ({ error: `these read-only commands were not allowed to run; allow them and try again: ${r.refused.join(' ; ')}` })
+const parse = t => { try { return t && String(t).trim() ? JSON.parse(t) : null } catch (e) { return null } }
 
-// A page for people combines several agents' reasoning, and the agent saving it may be refused for
-// copying it (architecture 5.2.1). Then the page without that reasoning is saved instead, when the
-// caller gives one: 'full', 'reduced', or false when neither was saved.
-async function recordPage(path, full, reduced, phase) {
-  const first = await recordFile(path, full, phase)
-  if (first) return 'full'
-  if (first !== null || !reduced) return false
-  log(`${path}: saving the page without the reasoning it carries`)
-  return (await recordFile(path, reduced, phase)) ? 'reduced' : false
-}
-// </lib:record>
+phase('Facts')
+// One relay for the git facts and what the record files say about the stage: the config, each goal
+// (its open questions), each approval in mode none, and five facts from each check.
+const f = await relay('facts', [
+  ['head', 'git rev-parse HEAD'],
+  ['branch', 'git branch --show-current'],
+  ['origin_head', 'git symbolic-ref --quiet --short refs/remotes/origin/HEAD'],
+  ['locals', 'git branch --list main master develop trunk'],
+  ['status', `git status --porcelain=v1 -uall -- . ':(exclude).rbb'`],
+  ['files', 'git -c core.quotepath=false ls-files --cached --others --exclude-standard -- .rbb/'],
+  ['ignored', 'git -c core.quotepath=false ls-files --others --ignored --exclude-standard -- .rbb/'],
+  ['log', `git log --format='%H %(trailers:key=RBB-Approved,valueonly,separator=%x2C)' -- .rbb/`],
+  ['records', 'tail -v -n +1 .rbb/config.json .rbb/*/goal.json .rbb/*/approval.json'],
+  // From each check.json, only what the stage needs, without printing the file.
+  ['check_scalars', `grep -H -o '^  "\\(head\\|verdict\\)": *"[^"]*"' .rbb/*/check.json`],
+  ['check_kinds', `grep -c -H '^      "kind":' .rbb/*/check.json`],
+  ['check_whys', `grep -c -H '^      "why":' .rbb/*/check.json`],
+  ['check_reasons', `grep -H -o '^    "reason": *"[^"]*"' .rbb/*/check.json`],
+])
+if (f && f.refused) return refusedError(f)
+if (f && !f.out.head.trim()) return { error: 'this repository has no commits yet; RBB needs a first commit to measure a change from' }
+if (!f || !SHA.test(f.out.head)) return { error: 'the relay of git facts failed' }
+const texts = splitTail(f.out.records)
+const [scalars, kinds, whys, reasons] = [f.out.check_scalars, f.out.check_kinds, f.out.check_whys, f.out.check_reasons].map(byFile)
+const documents = documentsMode(parse(texts['.rbb/config.json']))
+const folders = changeFolders([f.out.files, f.out.ignored]).filter(x => !only || x.change === only)
+if (!folders.length) return { head: f.out.head, branch: f.out.branch || null, documents, changes: [], lines: [], note: only ? `no records for ${only}` : 'no RBB change in this repository' }
+const target = targetBranch(f.out.origin_head, f.out.locals)
+const dirty = !!f.out.status
 
-// The skill passes {"change", "request"}. An agent that passes the argument text itself has passed
-// the request: the change is then named from its first words, as the skill would name it.
-const nameFromRequest = text => (String(text).toLowerCase().match(/[a-z0-9]+/g) || []).filter(w => w.length > 1).slice(0, 5).join('-').slice(0, 50).replace(/-+$/, '') || 'change'
-const change = typeof args === 'string' ? nameFromRequest(args) : args && args.change
-const request = typeof args === 'string' ? args : args && args.request
-const answers = (args && Array.isArray(args.answers)) ? args.answers : []
-if (!SLUG.test(change || '')) throw new Error(`rbb:goal needs a change name of lowercase words joined by hyphens, got: ${change}`)
-if (!(typeof request === 'string' && request.trim())) throw new Error('rbb:goal needs the request')
-const dir = `.rbb/${change}`
+const per = folders.map(x => {
+  const file = name => parse(texts[`.rbb/${x.change}/${name}`])
+  const goal = x.files.includes('goal.json') && !x.files.includes('spec.json') ? file('goal.json') : null
+  const approval = documents === 'none' ? file('approval.json') : null
+  const check = checkFacts(`.rbb/${x.change}/check.json`, scalars, kinds, whys, reasons)
+  const approvalCommit = documents === 'none' ? null : parseLog(f.out.log, x.change).latest
+  const approvedNone = documents === 'none' && approval && !approvalProblems(approval, x.change).length
+  // The commit the build is measured from: the approval commit, or in mode none the explored base.
+  const since = approvalCommit || (approvedNone ? approval.base : null)
+  return { ...x, goal, approval, check, approvalCommit, approved: !!(approvalCommit || approvedNone), since }
+})
 
-phase('Shape')
-let previous = null
-if (answers.length) {
-  const back = await agent(`Read the file ${dir}/goal.json and return its content verbatim, without line numbers.`, { label: 'read previous goal', phase: 'Shape', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })
-  try { previous = back && JSON.parse(back.content) } catch (e) { previous = null }
-  if (!previous) throw new Error(`answers were given but ${dir}/goal.json could not be read`)
-}
+// Git, per change: whether the code moved since the approval and since the check, and whether the
+// approval is reachable from the target while another branch is checked out.
+const cmds = per.flatMap((x, i) => [
+  ...(x.since ? [[`c${i}_since`, `git -c core.quotepath=false diff --name-only ${x.since} HEAD -- . ':(exclude).rbb'`]] : []),
+  ...(x.check && SHA.test(x.check.head || '') ? [[`c${i}_kind`, `git cat-file -t ${x.check.head}`], [`c${i}_check`, `git -c core.quotepath=false diff --name-only ${x.check.head} HEAD -- . ':(exclude).rbb'`]] : []),
+  // Merged means reachable from the target as the remote has it, when the remote has that branch:
+  // the local target may hold commits that were never pushed.
+  ...(x.approvalCommit && target && f.out.branch !== target ? [
+    [`c${i}_remote`, `git branch -r --list origin/${target}`],
+    [`c${i}_merged_remote`, `git branch -r --list origin/${target} --contains ${x.approvalCommit}`],
+    [`c${i}_merged_local`, `git branch --list ${target} --contains ${x.approvalCommit}`],
+  ] : []),
+])
+const g = await relay('changes', cmds)
+if (g && g.refused) return refusedError(g)
+if (!g) return { error: 'the relay of the changes\' git facts failed' }
 
-const task = previous
-  ? `Revise this goal with the requester's answers. When an answer agrees to something beyond the request, record it as an agreed extra (X1, X2...) with why it is here rather than a follow-up. When an answer asks for a change to the spec (the question "What should change in the spec?"), add it to the goal in the requester's own words, never reworded: as a new constraint (C...) when it says what must hold or must not change, as a new example (E...) when it gives an input and a result, as a new exclusion (O...) when it says what not to do; so that the check and the pull request hold it as their request, not as your restatement. Their answers stand; do not ask them again. An answer of "you decide", or bare agreement, means your recommendation. Keep every item that the answers do not change, with its id.\n\nThe goal:\n${JSON.stringify(previous, null, 2)}\n\nThe answers:\n${JSON.stringify(answers, null, 2)}`
-  : `Shape this request into a goal. Number examples E1, E2..., constraints C1..., and exclusions O1....\n\nThe request, as the requester wrote it:\n${request}`
-
-let goal = null, problems = []
-for (let attempt = 1; attempt <= 2 && !goal; attempt++) {
-  const draft = await agent(attempt === 1 ? task : `${task}\n\nYour last draft broke these rules; fix them:\n${problems.join('\n')}`, { label: `shape ${attempt}`, phase: 'Shape', agentType: 'rbb:shaper', effort: 'high', schema: GOAL_SCHEMA })
-  if (!draft) { problems = ['the shaper returned nothing']; continue }
-  const g = toGoal(draft, request)
-  // A new draft's questions must carry their options, reason and effects (strict); the saved goal
-  // is validated leniently, so older goals still read.
-  problems = [...validateGoal(g), ...questionProblems(g.questions)]
-  if (problems.length) continue
-  // Items cited by code: ask once to rephrase; on the second draft accept and note it.
-  const mentions = mentionProblems(g)
-  if (mentions.length && attempt === 1) { problems = mentions; continue }
-  if (mentions.length) log(`kept despite: ${mentions.join('; ')}`)
-  goal = g
-}
-if (!goal) return { change, error: 'the goal did not meet its format', problems }
-
-phase('Record')
-const savedJson = await recordFile(`${dir}/goal.json`, JSON.stringify(goal, null, 2) + '\n', 'Record', t => { try { return JSON.stringify(JSON.parse(t)) === JSON.stringify(goal) } catch (e) { return false } })
-const savedPage = await recordFile(`${dir}/goal.md`, goalPage(goal), 'Record')
-return { change, ready: goalReady(goal), questions: goal.questions, files: [`${dir}/goal.json`, `${dir}/goal.md`], recorded: !!(savedJson && savedPage) }
+phase('Derive')
+const changes = per.map((x, i) => {
+  const o = k => g.out[`c${i}_${k}`]
+  const mergedOut = o('remote') && o('remote').trim() ? o('merged_remote') : o('merged_local')
+  const facts = {
+    change: x.change, documents, files: x.files, goal: x.goal, approved: x.approved,
+    codeChangedSinceApproval: x.since ? !!o('since') : null,
+    check: x.check, head: f.out.head, dirty,
+    codeChangedSinceCheck: x.check && o('kind') === 'commit' ? !!o('check') : null,
+    mergedInto: mergedOut && mergedOut.trim() ? target : null,
+  }
+  const s = deriveStatus(facts)
+  return { change: x.change, stage: s.stage, line: statusLine(x.change, s, facts), approval: x.approvalCommit || (x.approved ? 'hashes' : null), check_head: x.check ? x.check.head || null : null }
+})
+return { head: f.out.head, branch: f.out.branch || null, target, documents, dirty, changes, lines: changes.map(c => c.line) }
