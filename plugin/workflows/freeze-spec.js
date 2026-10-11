@@ -403,12 +403,12 @@ function composeFindings(answer, meta, advocate = null) {
 // only add alternatives; a case that meets the bar turns a settled decision into a judgment call.
 const ADVOCATE = { model: 'opus', effort: 'high', alias: true }
 function ADVOCATE_SCHEMA(n) {
-  return { type: 'object', properties: { cases: { type: 'array', minItems: n, maxItems: n, items: { type: 'object', properties: {
+  return { type: 'object', properties: { saved_hash: { type: 'string', description: 'the output of git hash-object on the file you saved, run after saving it: 40 hex characters' }, cases: { type: 'array', minItems: n, maxItems: n, items: { type: 'object', properties: {
     decision: { type: 'integer', minimum: 1, maximum: n, description: 'the decision number, each once' },
     option: { type: 'string', description: 'the best other way of deciding, in a few words; empty when no other way meets the goal, every constraint and every example' },
     case: { type: 'string', description: 'why a competent developer could defensibly decide that way: the trade-off it wins, in terms of the code and the goal; empty when option is empty' },
     evidence: { type: 'string', description: 'file:line or a command and its output that the case rests on; empty when option is empty' },
-  }, required: ['decision', 'option', 'case', 'evidence'] } } }, required: ['cases'] }
+  }, required: ['decision', 'option', 'case', 'evidence'] } } }, required: ['cases', 'saved_hash'] }
 }
 function advocatePrompt(goal, decisions) {
   const must = JSON.stringify({ goal: goal.goal, done_when: goal.done_when, constraints: goal.constraints, out_of_scope: goal.out_of_scope }, null, 2)
@@ -471,9 +471,61 @@ function buildSpec(change, goal, findings, plan) {
 // The spec is spread over files, each saved once by its author (architecture 5.2.1): the goal, the
 // scout's findings and what code added to them, and the planner's plan. spec.json is only a manifest
 // naming them; every reader rebuilds the full spec in memory, so nothing an agent wrote is re-typed.
-const SPEC_PARTS = ['goal.json', 'scout.json', 'scout-meta.json', 'plan.json', 'advocate.json']
+const SPEC_PARTS = ['goal.json', 'scout.json', 'scout-meta.json', 'plan.json', 'advocate.json', 'spec-index.json']
 const SPEC_FILES = ['spec.json', ...SPEC_PARTS]
 const specManifest = (change, base, title) => ({ v: 2, change, base, title, parts: SPEC_PARTS })
+
+// The index (architecture 5.2.2): the structure every later stage needs from the spec, built by code
+// from the authors' answers while they are in memory, with no sentence of anyone's: item ids and
+// kinds, decisions and whether each is sure, the plan's steps with what they serve and where they
+// touch, and the blob id of each record as its author saved it. Code-made, so any agent may relay it.
+const RECORD_FILES = ['goal.json', 'scout.json', 'advocate.json', 'plan.json']
+function specIndex(spec, hashes) {
+  const kind = id => ({ E: 'example', C: 'constraint', O: 'exclusion', X: 'agreed extra' })[String(id)[0]]
+  const items = [...spec.done_when, ...spec.constraints, ...spec.out_of_scope, ...(spec.agreed_extras || [])].map(i => ({ id: i.id, kind: kind(i.id) }))
+  return {
+    v: 1, change: spec.change, base: spec.base, title: spec.title,
+    items,
+    decisions: spec.decisions.map(d => ({ id: d.id, sure: !!d.sure })),
+    steps: spec.plan.steps.map(s => ({ id: s.id, serves: s.serves, locations: s.locations.map(l => ({ file: l.file, ...(l.lines ? { lines: l.lines } : {}), ...(l.symbol ? { symbol: l.symbol } : {}), change: l.change })) })),
+    hashes: Object.fromEntries(RECORD_FILES.filter(f => hashes && /^[0-9a-f]{40}$/.test(hashes[f] || '')).map(f => [f, hashes[f]])),
+  }
+}
+// What a later stage checks before it trusts an index: its shape, that it is this change's, and that
+// its hashes are blob ids of the record files. The records themselves are compared with git.
+function indexProblems(x, change) {
+  if (!x || typeof x !== 'object') return ['spec-index.json: missing or not an object']
+  const errs = []
+  if (x.v !== 1) errs.push('spec-index.json: expected {"v": 1, ...}')
+  if (x.change !== change) errs.push(`spec-index.json: change is ${x.change}, expected ${change}`)
+  if (!/^[0-9a-f]{40}$/.test(x.base || '')) errs.push('spec-index.json: base must be a commit id')
+  if (!isStr(x.title)) errs.push('spec-index.json: title missing')
+  for (const k of ['items', 'decisions', 'steps']) if (!Array.isArray(x[k])) errs.push(`spec-index.json: ${k} must be a list`)
+  if (Array.isArray(x.steps) && !x.steps.length) errs.push('spec-index.json: at least one step')
+  const h = x.hashes && typeof x.hashes === 'object' ? x.hashes : null
+  if (!h || !/^[0-9a-f]{40}$/.test(h['plan.json'] || '') || !/^[0-9a-f]{40}$/.test(h['scout.json'] || '')) errs.push('spec-index.json: hashes must give the blob id of scout.json and plan.json')
+  if (h) for (const f of Object.keys(h)) if (!RECORD_FILES.includes(f) || !/^[0-9a-f]{40}$/.test(h[f] || '')) errs.push(`spec-index.json: hashes.${f} is not a record file's blob id`)
+  return errs
+}
+// The spec's structure as a later stage's code needs it, from the index alone: ids for the schemas,
+// steps and locations for the mapping, the title for commit subjects. Every text field is absent.
+function specFromIndex(x) {
+  const of = k => x.items.filter(i => i.kind === k).map(i => ({ id: i.id }))
+  return {
+    v: 1, change: x.change, base: x.base, title: x.title,
+    done_when: of('example'), constraints: of('constraint'), out_of_scope: of('exclusion'), agreed_extras: of('agreed extra'),
+    decisions: x.decisions.map(d => ({ id: d.id, sure: d.sure })),
+    plan: { steps: x.steps.map(s => ({ id: s.id, serves: s.serves, locations: s.locations })) },
+  }
+}
+// The index with the goal's own words on its items: what the check's pages may say. The goal is the
+// requester's requirements, not an agent's reasoning, so its text travels; decisions and steps stay
+// ids, and a page names them by number.
+function specWithGoal(index, goal) {
+  const s = specFromIndex(index)
+  const withText = (ids, items) => ids.map(i => { const it = (items || []).find(x => x.id === i.id) || {}; return { ...i, ...(it.text ? { text: it.text } : {}), ...(it.why ? { why: it.why } : {}) } })
+  return { ...s, goal: goal.goal, ...(goal.reading ? { reading: goal.reading } : {}), source_request: goal.source_request, done_when: withText(s.done_when, goal.done_when), constraints: withText(s.constraints, goal.constraints), out_of_scope: withText(s.out_of_scope, goal.out_of_scope), agreed_extras: withText(s.agreed_extras, goal.agreed_extras) }
+}
 
 // texts: each spec file's content by name ('' when missing). A spec.json from before the manifest
 // holds the whole spec and needs no other file; a manifest names the files it has (advocate.json
@@ -529,7 +581,9 @@ function decisionLines(d, when) {
 
 // A page saved without its reasoning (architecture 5.2.1), when the agent saving the full page was
 // refused for copying it: the record files hold the reasoning in full, and the page says so.
-const reasonsLeftOut = files => `*The reasons behind each decision, the alternatives considered and what could change it are left off this page: the agent saving it was not allowed to copy another agent's reasoning. They are in full in ${files.map(f => `\`${f}\``).join(', ')}.*`
+// Why a page carries no reasoning: a refused save (the default), or the design, which never copies
+// another agent's reasoning onto the review (architecture 5.2.2).
+const reasonsLeftOut = (files, why = "the agent saving it was not allowed to copy another agent's reasoning") => `*The reasons behind each decision, the alternatives considered and what could change it are left off this page: ${why}. They are in full in ${files.map(f => `\`${f}\``).join(', ')}.*`
 
 // The spec as a page for the requester and the reviewer: what and why first, then how.
 // With { reasons: false }, the decisions are one line each and the page says where the reasons are.
@@ -659,6 +713,25 @@ async function recordPage(path, full, reduced, phase) {
   log(`${path}: saving the page without the reasoning it carries`)
   return (await recordFile(path, reduced, phase)) ? 'reduced' : false
 }
+
+// A record an author saved itself is verified without a read-back, which would ask another agent to
+// reproduce its author's reasoning (architecture 5.2.2): the author's own blob id against the id two
+// relays compute, and a count of the record's items against the answer's. Prose equality is not
+// proven, and the design says so. Returns {hash, now} (now: the relayed clock, seconds) or {error}.
+const VERIFY_SCHEMA = { type: 'object', properties: { hash: { type: 'string', description: 'stdout of the git hash-object command, verbatim' }, count: { type: 'string', description: 'stdout of the grep command, verbatim' }, now: { type: 'string', description: 'stdout of date +%s, verbatim' } }, required: ['hash', 'count', 'now'] }
+const clockOf = r => (r && /^\d{9,11}$/.test(String(r.now || '').trim()) ? Number(String(r.now).trim()) : null)
+async function verifySave(path, claimed, itemPattern, expected, phase) {
+  const cmd = `Run these commands in the current directory, one at a time, and return each one's standard output verbatim:\nhash: git hash-object -- ${path}\ncount: grep -o -E '${itemPattern}' ${path} | grep -c .\nnow: date +%s`
+  const r = await parallel([1, 2].map(i => () => agent(cmd, { label: `verify ${path} ${i}`, phase, agentType: 'rbb:checker', effort: 'low', schema: VERIFY_SCHEMA })))
+  if (!r[0] || !r[1]) return { error: `${path} could not be verified (a relay failed)` }
+  const hash = r[0].hash.trim(), count = Number(r[0].count.trim())
+  if (hash !== r[1].hash.trim() || count !== Number(r[1].count.trim())) return { error: `${path} could not be verified (the two relays disagreed)` }
+  if (!/^[0-9a-f]{40}$/.test(hash)) return { error: `${path} was not saved` }
+  const said = String(claimed || '').trim()
+  if (hash !== said) return { error: `${path} is not the file its author hashed after saving (${hash.slice(0, 10)} on disk, ${said.slice(0, 10) || 'none'} claimed)` }
+  if (count !== expected) return { error: `${path} holds ${count} items where the answer has ${expected}` }
+  return { hash, now: clockOf(r[0]) }
+}
 // </lib:record>
 
 // The skill passes {"change": ...}; an agent that passes the argument text itself means its first word.
@@ -668,22 +741,33 @@ const dir = `.rbb/${change}`
 const relay = (label, cmd) => agent(`Run \`${cmd}\` in the current directory and return its standard output verbatim. If it fails or prints nothing, return an empty string.`, { label, phase: 'Check', agentType: 'rbb:checker', effort: 'low', schema: { type: 'object', properties: { out: { type: 'string' } }, required: ['out'] } })
 
 phase('Check')
-// The spec, rebuilt in memory from its manifest and the files it names.
-const backs = await parallel(SPEC_FILES.map(f => () => agent(`Read the file ${dir}/${f} and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label: `read ${f}`, phase: 'Check', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })))
-const built = specFromTexts(change, Object.fromEntries(SPEC_FILES.map((f, n) => [f, backs[n] ? backs[n].content : ''])))
-// The files this spec is made of, as its manifest names them: what is committed or hashed.
-const manifest = (() => { try { return backs[0] && backs[0].content.trim() ? JSON.parse(backs[0].content) : null } catch (e) { return null } })()
+// The approval reads only what code made (architecture 5.2.2): the manifest, which names the spec's
+// files, and the index, which carries the base, the title and the blob id of each record as its
+// author saved it. The records themselves are never relayed; git says whether they are unchanged.
+const codeMade = async f => { const b = await agent(`Read the file ${dir}/${f} and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label: `read ${f}`, phase: 'Check', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA }); try { return b && b.content.trim() ? JSON.parse(b.content) : null } catch (e) { return null } }
+const [manifest, index] = await parallel([() => codeMade('spec.json'), () => codeMade('spec-index.json')])
+if (!manifest || !Array.isArray(manifest.parts)) return { change, error: `${dir}/spec.json is missing or is not a manifest; draft the spec again with /rbb:approve` }
+if (!manifest.parts.includes('spec-index.json')) return { change, error: 'this spec was drafted before the index existed; draft it again with /rbb:approve' }
+const problems = indexProblems(index, change)
+if (problems.length) return { change, error: 'the spec index does not meet its format', problems }
+if (index.base !== manifest.base) return { change, error: 'spec.json and spec-index.json name different base commits' }
 const files = specFiles(manifest)
-const spec = built.spec || null
-const problems = spec ? validateSpec(spec, change) : [built.error]
-if (problems.length) return { change, error: 'the spec does not meet its format', problems }
+const base = index.base
+const title = manifest.title
+// Each record on disk must still be the file its author saved: its blob id against the index's.
+const recordFiles = Object.keys(index.hashes)
+const hashRuns = await parallel([1, 2].map(i => () => relay(`records ${i}`, `git hash-object -- ${recordFiles.map(f => `${dir}/${f}`).join(' ')}`)))
+const onDisk = hashRuns.every(h => h && h.out.trim() === hashRuns[0].out.trim()) ? hashRuns[0].out.trim().split(/\s+/) : []
+if (onDisk.length !== recordFiles.length) return { change, error: 'could not hash the spec records (the two relays of git hash-object failed or disagreed)' }
+const changed = recordFiles.filter((f, n) => onDisk[n] !== index.hashes[f])
+if (changed.length) return { change, error: `these records changed since the spec was drafted: ${changed.join(', ')}; draft it again with /rbb:approve`, changed }
 
 // The plan's line numbers refer to the commit the scout explored; approving on top of a moved
 // HEAD would make them wrong. Two relays of HEAD must agree.
 const heads = await parallel([1, 2].map(i => () => relay(`head ${i}`, 'git rev-parse HEAD')))
 const head = heads.every(h => h && /^[0-9a-f]{40}$/.test(h.out.trim()) && h.out.trim() === heads[0].out.trim()) ? heads[0].out.trim() : null
 if (!head) return { change, error: 'could not read HEAD (the two relays failed or disagreed); is this a git repository with a commit?' }
-if (head !== spec.base) return { change, error: `HEAD (${head.slice(0, 10)}) is not the commit the plan was written against (${spec.base.slice(0, 10)}); run the scout and spec drafting again`, moved: true }
+if (head !== base) return { change, error: `HEAD (${head.slice(0, 10)}) is not the commit the plan was written against (${base.slice(0, 10)}); run the scout and spec drafting again`, moved: true }
 
 phase('Commit')
 // The project's commit style, as detected or answered (.rbb/config.json); plain when not set.
@@ -699,7 +783,7 @@ if (documentsMode(config) === 'none') {
   const runs = await parallel([1, 2].map(i => () => relay(`hash ${i}`, cmd)))
   const ids = runs.every(h => h && h.out.trim() === runs[0].out.trim()) ? runs[0].out.trim().split(/\s+/) : []
   if (ids.length !== files.length || ids.some(h => !/^[0-9a-f]{40}$/.test(h))) return { change, error: 'could not compute the spec hashes (the two relays of git hash-object failed or disagreed)' }
-  const approval = { v: 1, change, base: spec.base, hashes: Object.fromEntries(files.map((f, n) => [f, ids[n]])) }
+  const approval = { v: 1, change, base, hashes: Object.fromEntries(files.map((f, n) => [f, ids[n]])) }
   const saved = await recordFile(`${dir}/approval.json`, JSON.stringify(approval, null, 2) + '\n', 'Commit', t => { try { return JSON.stringify(JSON.parse(t)) === JSON.stringify(approval) } catch (e) { return false } })
   if (!saved) return { change, error: 'approval.json could not be saved and verified' }
   return { change, approved: true, documents: 'none', hashes: approval.hashes }
@@ -711,12 +795,12 @@ const PAGES = ['spec.md', 'goal.md']
 const pagesFound = await relay('pages', `git ls-files --others --cached --exclude-standard -- ${PAGES.map(p => `${dir}/${p}`).join(' ')}`)
 if (!pagesFound) return { change, error: 'could not list the pages to commit with the spec; nothing was committed' }
 const pages = PAGES.filter(p => pagesFound.out.split('\n').map(l => l.trim()).includes(`${dir}/${p}`))
-const subject = approvalSubject(spec, style)
+const subject = approvalSubject({ title, change }, style)
 const cmds = approvalCommands(change, subject, pages, files)
 await agent(`Run these commands:\n${cmds.map((c, n) => `${n + 1}. ${c}`).join('\n')}`, { label: 'commit', phase: 'Commit', agentType: 'rbb:committer', effort: 'low' })
 
 // Verified from git, not from the committer's report.
 const log = await relay('verify', `git log -1 --format='%H %P %(trailers:key=RBB-Approved,valueonly)'`)
 const [sha, parent, value] = (log && log.out.trim().split(/\s+/)) || []
-const ok = /^[0-9a-f]{40}$/.test(sha || '') && parent === spec.base && value === change
+const ok = /^[0-9a-f]{40}$/.test(sha || '') && parent === base && value === change
 return ok ? { change, approved: true, commit: sha, subject } : { change, error: 'the approval commit was not found with its trailer; check git status', commands: cmds }

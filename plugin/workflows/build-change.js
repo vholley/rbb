@@ -405,12 +405,12 @@ function composeFindings(answer, meta, advocate = null) {
 // only add alternatives; a case that meets the bar turns a settled decision into a judgment call.
 const ADVOCATE = { model: 'opus', effort: 'high', alias: true }
 function ADVOCATE_SCHEMA(n) {
-  return { type: 'object', properties: { cases: { type: 'array', minItems: n, maxItems: n, items: { type: 'object', properties: {
+  return { type: 'object', properties: { saved_hash: { type: 'string', description: 'the output of git hash-object on the file you saved, run after saving it: 40 hex characters' }, cases: { type: 'array', minItems: n, maxItems: n, items: { type: 'object', properties: {
     decision: { type: 'integer', minimum: 1, maximum: n, description: 'the decision number, each once' },
     option: { type: 'string', description: 'the best other way of deciding, in a few words; empty when no other way meets the goal, every constraint and every example' },
     case: { type: 'string', description: 'why a competent developer could defensibly decide that way: the trade-off it wins, in terms of the code and the goal; empty when option is empty' },
     evidence: { type: 'string', description: 'file:line or a command and its output that the case rests on; empty when option is empty' },
-  }, required: ['decision', 'option', 'case', 'evidence'] } } }, required: ['cases'] }
+  }, required: ['decision', 'option', 'case', 'evidence'] } } }, required: ['cases', 'saved_hash'] }
 }
 function advocatePrompt(goal, decisions) {
   const must = JSON.stringify({ goal: goal.goal, done_when: goal.done_when, constraints: goal.constraints, out_of_scope: goal.out_of_scope }, null, 2)
@@ -473,9 +473,61 @@ function buildSpec(change, goal, findings, plan) {
 // The spec is spread over files, each saved once by its author (architecture 5.2.1): the goal, the
 // scout's findings and what code added to them, and the planner's plan. spec.json is only a manifest
 // naming them; every reader rebuilds the full spec in memory, so nothing an agent wrote is re-typed.
-const SPEC_PARTS = ['goal.json', 'scout.json', 'scout-meta.json', 'plan.json', 'advocate.json']
+const SPEC_PARTS = ['goal.json', 'scout.json', 'scout-meta.json', 'plan.json', 'advocate.json', 'spec-index.json']
 const SPEC_FILES = ['spec.json', ...SPEC_PARTS]
 const specManifest = (change, base, title) => ({ v: 2, change, base, title, parts: SPEC_PARTS })
+
+// The index (architecture 5.2.2): the structure every later stage needs from the spec, built by code
+// from the authors' answers while they are in memory, with no sentence of anyone's: item ids and
+// kinds, decisions and whether each is sure, the plan's steps with what they serve and where they
+// touch, and the blob id of each record as its author saved it. Code-made, so any agent may relay it.
+const RECORD_FILES = ['goal.json', 'scout.json', 'advocate.json', 'plan.json']
+function specIndex(spec, hashes) {
+  const kind = id => ({ E: 'example', C: 'constraint', O: 'exclusion', X: 'agreed extra' })[String(id)[0]]
+  const items = [...spec.done_when, ...spec.constraints, ...spec.out_of_scope, ...(spec.agreed_extras || [])].map(i => ({ id: i.id, kind: kind(i.id) }))
+  return {
+    v: 1, change: spec.change, base: spec.base, title: spec.title,
+    items,
+    decisions: spec.decisions.map(d => ({ id: d.id, sure: !!d.sure })),
+    steps: spec.plan.steps.map(s => ({ id: s.id, serves: s.serves, locations: s.locations.map(l => ({ file: l.file, ...(l.lines ? { lines: l.lines } : {}), ...(l.symbol ? { symbol: l.symbol } : {}), change: l.change })) })),
+    hashes: Object.fromEntries(RECORD_FILES.filter(f => hashes && /^[0-9a-f]{40}$/.test(hashes[f] || '')).map(f => [f, hashes[f]])),
+  }
+}
+// What a later stage checks before it trusts an index: its shape, that it is this change's, and that
+// its hashes are blob ids of the record files. The records themselves are compared with git.
+function indexProblems(x, change) {
+  if (!x || typeof x !== 'object') return ['spec-index.json: missing or not an object']
+  const errs = []
+  if (x.v !== 1) errs.push('spec-index.json: expected {"v": 1, ...}')
+  if (x.change !== change) errs.push(`spec-index.json: change is ${x.change}, expected ${change}`)
+  if (!/^[0-9a-f]{40}$/.test(x.base || '')) errs.push('spec-index.json: base must be a commit id')
+  if (!isStr(x.title)) errs.push('spec-index.json: title missing')
+  for (const k of ['items', 'decisions', 'steps']) if (!Array.isArray(x[k])) errs.push(`spec-index.json: ${k} must be a list`)
+  if (Array.isArray(x.steps) && !x.steps.length) errs.push('spec-index.json: at least one step')
+  const h = x.hashes && typeof x.hashes === 'object' ? x.hashes : null
+  if (!h || !/^[0-9a-f]{40}$/.test(h['plan.json'] || '') || !/^[0-9a-f]{40}$/.test(h['scout.json'] || '')) errs.push('spec-index.json: hashes must give the blob id of scout.json and plan.json')
+  if (h) for (const f of Object.keys(h)) if (!RECORD_FILES.includes(f) || !/^[0-9a-f]{40}$/.test(h[f] || '')) errs.push(`spec-index.json: hashes.${f} is not a record file's blob id`)
+  return errs
+}
+// The spec's structure as a later stage's code needs it, from the index alone: ids for the schemas,
+// steps and locations for the mapping, the title for commit subjects. Every text field is absent.
+function specFromIndex(x) {
+  const of = k => x.items.filter(i => i.kind === k).map(i => ({ id: i.id }))
+  return {
+    v: 1, change: x.change, base: x.base, title: x.title,
+    done_when: of('example'), constraints: of('constraint'), out_of_scope: of('exclusion'), agreed_extras: of('agreed extra'),
+    decisions: x.decisions.map(d => ({ id: d.id, sure: d.sure })),
+    plan: { steps: x.steps.map(s => ({ id: s.id, serves: s.serves, locations: s.locations })) },
+  }
+}
+// The index with the goal's own words on its items: what the check's pages may say. The goal is the
+// requester's requirements, not an agent's reasoning, so its text travels; decisions and steps stay
+// ids, and a page names them by number.
+function specWithGoal(index, goal) {
+  const s = specFromIndex(index)
+  const withText = (ids, items) => ids.map(i => { const it = (items || []).find(x => x.id === i.id) || {}; return { ...i, ...(it.text ? { text: it.text } : {}), ...(it.why ? { why: it.why } : {}) } })
+  return { ...s, goal: goal.goal, ...(goal.reading ? { reading: goal.reading } : {}), source_request: goal.source_request, done_when: withText(s.done_when, goal.done_when), constraints: withText(s.constraints, goal.constraints), out_of_scope: withText(s.out_of_scope, goal.out_of_scope), agreed_extras: withText(s.agreed_extras, goal.agreed_extras) }
+}
 
 // texts: each spec file's content by name ('' when missing). A spec.json from before the manifest
 // holds the whole spec and needs no other file; a manifest names the files it has (advocate.json
@@ -531,7 +583,9 @@ function decisionLines(d, when) {
 
 // A page saved without its reasoning (architecture 5.2.1), when the agent saving the full page was
 // refused for copying it: the record files hold the reasoning in full, and the page says so.
-const reasonsLeftOut = files => `*The reasons behind each decision, the alternatives considered and what could change it are left off this page: the agent saving it was not allowed to copy another agent's reasoning. They are in full in ${files.map(f => `\`${f}\``).join(', ')}.*`
+// Why a page carries no reasoning: a refused save (the default), or the design, which never copies
+// another agent's reasoning onto the review (architecture 5.2.2).
+const reasonsLeftOut = (files, why = "the agent saving it was not allowed to copy another agent's reasoning") => `*The reasons behind each decision, the alternatives considered and what could change it are left off this page: ${why}. They are in full in ${files.map(f => `\`${f}\``).join(', ')}.*`
 
 // The spec as a page for the requester and the reviewer: what and why first, then how.
 // With { reasons: false }, the decisions are one line each and the page says where the reasons are.
@@ -726,7 +780,8 @@ function BUILDER_SCHEMA(spec) {
     stop: { type: ['string', 'null'], description: 'why you stopped without changing anything, or null' },
     commit_type: { type: 'string', enum: COMMIT_TYPES, description: 'the kind of change, for the commit message' },
     files_created: { type: 'array', items: { type: 'string' }, description: 'the path of every new file that is part of the change, relative to the repository root; files your runs produced are not part of it' },
-  }, required: [...log.required, 'stop', 'commit_type', 'files_created'] }
+    saved_hash: { type: 'string', description: 'the output of git hash-object on the log file you saved, run after saving it: 40 hex characters; empty when you stopped and saved nothing' },
+  }, required: [...log.required, 'stop', 'commit_type', 'files_created', 'saved_hash'] }
 }
 
 // Paths as git prints them: forward slashes, no leading ./, no trailing slash.
@@ -797,6 +852,25 @@ async function recordPage(path, full, reduced, phase) {
   log(`${path}: saving the page without the reasoning it carries`)
   return (await recordFile(path, reduced, phase)) ? 'reduced' : false
 }
+
+// A record an author saved itself is verified without a read-back, which would ask another agent to
+// reproduce its author's reasoning (architecture 5.2.2): the author's own blob id against the id two
+// relays compute, and a count of the record's items against the answer's. Prose equality is not
+// proven, and the design says so. Returns {hash, now} (now: the relayed clock, seconds) or {error}.
+const VERIFY_SCHEMA = { type: 'object', properties: { hash: { type: 'string', description: 'stdout of the git hash-object command, verbatim' }, count: { type: 'string', description: 'stdout of the grep command, verbatim' }, now: { type: 'string', description: 'stdout of date +%s, verbatim' } }, required: ['hash', 'count', 'now'] }
+const clockOf = r => (r && /^\d{9,11}$/.test(String(r.now || '').trim()) ? Number(String(r.now).trim()) : null)
+async function verifySave(path, claimed, itemPattern, expected, phase) {
+  const cmd = `Run these commands in the current directory, one at a time, and return each one's standard output verbatim:\nhash: git hash-object -- ${path}\ncount: grep -o -E '${itemPattern}' ${path} | grep -c .\nnow: date +%s`
+  const r = await parallel([1, 2].map(i => () => agent(cmd, { label: `verify ${path} ${i}`, phase, agentType: 'rbb:checker', effort: 'low', schema: VERIFY_SCHEMA })))
+  if (!r[0] || !r[1]) return { error: `${path} could not be verified (a relay failed)` }
+  const hash = r[0].hash.trim(), count = Number(r[0].count.trim())
+  if (hash !== r[1].hash.trim() || count !== Number(r[1].count.trim())) return { error: `${path} could not be verified (the two relays disagreed)` }
+  if (!/^[0-9a-f]{40}$/.test(hash)) return { error: `${path} was not saved` }
+  const said = String(claimed || '').trim()
+  if (hash !== said) return { error: `${path} is not the file its author hashed after saving (${hash.slice(0, 10)} on disk, ${said.slice(0, 10) || 'none'} claimed)` }
+  if (count !== expected) return { error: `${path} holds ${count} items where the answer has ${expected}` }
+  return { hash, now: clockOf(r[0]) }
+}
 // </lib:record>
 
 // <lib:alternatives> copied from src/lib/alternatives.js by tools/sync-lib.mjs; edit the source, not this copy
@@ -850,7 +924,11 @@ if (f1.status.trim()) return { change, error: 'the working tree has changes outs
 // The spec, rebuilt in memory from its manifest and the files it names (architecture 5.2.1).
 const dir = `.rbb/${change}`
 const readText = async (file, label) => { const b = await agent(`Read the file ${file} and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label, phase: 'Ready', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA }); return b ? b.content : '' }
-let spec = null
+// Code reads only what code made (architecture 5.2.2): the manifest and the index, frozen by the
+// approval, and the goal, which is the requester's requirements. The records are hashed against the
+// index and read by the builder itself, never relayed.
+const parse = t => { try { return t && String(t).trim() ? JSON.parse(t) : null } catch (e) { return null } }
+let index = null, manifest = null, goal = null, frozenAt = null
 if (none) {
   // Mode none (architecture 9.1): the files on this machine, accepted only if each has its approved hash.
   let approval = null
@@ -859,51 +937,73 @@ if (none) {
   const h = await relay('spec hashes', [['hashes', `git hash-object ${hashedFiles(approval).map(f => `${dir}/${f}`).join(' ')}`]])
   const changed = h ? changedSpecFiles(approval, h.hashes) : hashedFiles(approval)
   if (changed.length) return { change, error: `the spec changed after it was approved (${changed.join(', ')}); approve it again` }
-  const texts = await parallel(SPEC_FILES.map(f => () => readText(`${dir}/${f}`, `read ${f}`)))
-  const built = specFromTexts(change, Object.fromEntries(SPEC_FILES.map((f, n) => [f, texts[n]])))
-  spec = built.spec
-  if (!spec || validateSpec(spec, change).length || spec.base !== approval.base) return { change, error: `the approved spec could not be read, or does not meet its format${built.error ? `: ${built.error}` : ''}` }
+  const [m, x, g] = await parallel([() => readText(`${dir}/spec.json`, 'read spec.json'), () => readText(`${dir}/spec-index.json`, 'read spec-index.json'), () => readText(`${dir}/goal.json`, 'read goal.json')])
+  manifest = parse(m); index = parse(x); goal = parse(g)
+  frozenAt = null
 } else {
   const approvals = parseLog(f1.log, change)
   if (!approvals.latest) return { change, error: `no approval commit for ${change}; approve the spec first` }
-  const f2 = await relay('frozen spec', SPEC_FILES.map((f, n) => [`f${n}`, `git show ${approvals.latest}:${dir}/${f}`]))
-  const built = f2 ? specFromTexts(change, Object.fromEntries(SPEC_FILES.map((f, n) => [f, f2[`f${n}`]]))) : { error: 'the relays of the spec disagreed' }
-  spec = built.spec
-  if (!spec || validateSpec(spec, change).length) return { change, error: `the approved spec could not be read from its approval commit, or does not meet its format${built.error ? `: ${built.error}` : ''}` }
+  frozenAt = approvals.latest
+  const f2 = await relay('frozen spec', [['manifest', `git show ${frozenAt}:${dir}/spec.json`], ['index', `git show ${frozenAt}:${dir}/spec-index.json`], ['goal', `git show ${frozenAt}:${dir}/goal.json`]])
+  if (!f2) return { change, error: 'the relays of the approved spec disagreed or failed' }
+  manifest = parse(f2.manifest); index = parse(f2.index); goal = parse(f2.goal)
 }
+if (!manifest || !Array.isArray(manifest.parts) || !manifest.parts.includes('spec-index.json')) return { change, error: 'this spec was drafted before the index existed; draft and approve it again with /rbb:approve' }
+const indexErrors = indexProblems(index, change)
+if (indexErrors.length) return { change, error: 'the approved spec index does not meet its format', problems: indexErrors }
+if (!goal || validateGoal(goal).length) return { change, error: `${dir}/goal.json is missing or does not meet the goal format` }
+// Each record on disk must still be the file its author saved, since the builder reads it there.
+const recordFiles = Object.keys(index.hashes)
+const onDisk = await relay('records', [['hashes', `git hash-object -- ${recordFiles.map(f => `${dir}/${f}`).join(' ')}`]])
+const ids = onDisk ? onDisk.hashes.trim().split(/\s+/) : []
+const moved = recordFiles.filter((f, n) => ids[n] !== index.hashes[f])
+if (!onDisk || moved.length) return { change, error: moved.length ? `these records differ from the approved spec: ${moved.join(', ')}; restore them (git checkout of the approval commit) before building` : 'the two relays of the record hashes disagreed or failed' }
+const spec = specFromIndex(index)
+// What the builder reads, in its own words to it: the frozen files, by path.
+const specReading = `The approved spec is in these files under ${dir}/, frozen${frozenAt ? ` in commit ${frozenAt}` : ''} and verified unchanged on disk; read them with the Read tool before you change anything: spec.md (the page the requester approved), goal.json (the goal, its examples, constraints and exclusions), scout.json (the findings and every decision with its reasons), plan.json (the steps and where each touches the code), advocate.json (the alternatives an independent advocate raised), spec-index.json (the ids of every item and step, which your log cites).`
 
 phase('Build')
 let answer = null, problems = []
 for (let attempt = 1; attempt <= 2 && !answer; attempt++) {
   // A retry only corrects the log: the change is already made, and building again would stack edits.
   const prompt = attempt === 1
-    ? `Build this approved change in the current repository. When you are done, run git diff and check every claim and decision of your log against it: the log says only what the diff shows. Then save your log to ${dir}/build.json as described in your instructions, and return the same log.\n\nThe approved spec:\n${JSON.stringify(spec, null, 2)}`
-    : `You have already built this change. Change no file of the project. Save your log again to ${dir}/build.json, corrected for these problems, then return the same log:\n${problems.join('\n')}\n\nThe approved spec:\n${JSON.stringify(spec, null, 2)}`
+    ? `Build this approved change in the current repository. When you are done, run git diff and check every claim and decision of your log against it: the log says only what the diff shows. Then save your log to ${dir}/build.json as described in your instructions, and return the same log.\n\n${specReading}`
+    : `You have already built this change. Change no file of the project. Save your log again to ${dir}/build.json, corrected for these problems, then return the same log:\n${problems.join('\n')}\n\n${specReading}`
   const a = await agent(prompt, { label: `build ${attempt}`, phase: 'Build', agentType: 'rbb:builder', model: run.model, effort: run.effort, schema: BUILDER_SCHEMA(spec) })
   if (!a) { problems = ['the builder returned nothing']; continue }
   if (a.stop) return { change, stopped: a.stop, note: 'nothing was committed; review the spec or the example' }
-  const log = toBuildLog(a, run)
+  // The builder's blob id of its saved log travels in its answer and is not part of the log.
+  const { saved_hash: logHash, ...body } = a
+  const log = toBuildLog(body, run)
   problems = parseBuild(JSON.stringify(log), spec).errors
-  if (!problems.length) answer = { a, log }
+  if (!problems.length) answer = { a: body, log, hash: logHash }
 }
 if (!answer) return { change, error: 'the build log did not meet its format', problems }
 
-// The builder saved its own log (architecture 5.2.1): read back, it must equal its answer. No retry,
-// since another agent would have to re-type it.
-const savedBack = await readText(`${dir}/build.json`, 'read back build.json')
-let savedLog = null
-try { savedLog = savedBack.trim() ? JSON.parse(savedBack) : null } catch (e) { savedLog = null }
-if (!savedLog || !sameJson(savedLog, answer.a)) return { change, error: `the builder did not save ${dir}/build.json, or saved something other than its log; nothing was committed` }
+// The builder saved its own log. A read-back would ask another agent to reproduce its reasoning
+// (architecture 5.2.2), so the save is verified by the builder's own blob id and a count of its
+// evidence entries, one per example it ran.
+const logSaved = await verifySave(`${dir}/build.json`, answer.hash, '"after" *:', answer.a.evidence.length, 'Build')
+if (logSaved.error) return { change, error: `${logSaved.error}; nothing was committed` }
 
 // An agent that saw neither the builder's conversation nor its reasons judges each alternative. Its
 // verdicts reach the record only as keep or drop, in build-meta.json, with the stamps code adds.
 phase('Review')
 const runStamp = { model: run.model, effort: run.effort, ...(run.alias ? { alias: true } : {}) }
 const pre = composeBuildLog(answer.a, { run: runStamp }).entries.filter(e => e.kind === 'decision')
-const reviewed = await reviewAlternatives(spec, pre, 'Review')
+const reviewed = await reviewAlternatives(goal, pre, 'Review')
 const done = reviewed.some(d => d.alternatives_reviewed_by)
 const review = pre.some(d => (d.alternatives || []).length) && done ? { by: ALT_REVIEWER, keep: pre.map((d, i) => (d.alternatives || []).map(a => reviewed[i].alternatives.includes(a))) } : null
-const buildMeta = { v: 1, run: runStamp, review }
+// The log's structure for the check (architecture 5.2.2): ids and what they cite, no sentence of the
+// builder's, so that the check's code never relays the log; its judge reads the file itself.
+const parsed = parseBuild(JSON.stringify(answer.log), spec)
+const logIndex = {
+  evidence: answer.a.evidence.map(e => e.item),
+  decisions: parsed.decisions.map(d => ({ id: d.id, serves: d.serves || [] })),
+  deviations: parsed.deviations.map(d => ({ id: d.id, step: d.step })),
+  claims: parsed.claims.map(c => c.id),
+}
+const buildMeta = { v: 1, run: runStamp, review, hashes: { 'build.json': logSaved.hash }, index: logIndex }
 
 phase('Commit')
 const style = config && config.commit

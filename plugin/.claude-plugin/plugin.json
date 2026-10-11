@@ -1,6 +1,6 @@
 {
   "name": "rbb",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Record Before Build: a frozen spec with its plan, an independent check of the change against both, and a review a person can trust.",
   "author": { "name": "V Holley" },
   "license": "Apache-2.0"

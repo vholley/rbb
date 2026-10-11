@@ -404,12 +404,12 @@ function composeFindings(answer, meta, advocate = null) {
 // only add alternatives; a case that meets the bar turns a settled decision into a judgment call.
 const ADVOCATE = { model: 'opus', effort: 'high', alias: true }
 function ADVOCATE_SCHEMA(n) {
-  return { type: 'object', properties: { cases: { type: 'array', minItems: n, maxItems: n, items: { type: 'object', properties: {
+  return { type: 'object', properties: { saved_hash: { type: 'string', description: 'the output of git hash-object on the file you saved, run after saving it: 40 hex characters' }, cases: { type: 'array', minItems: n, maxItems: n, items: { type: 'object', properties: {
     decision: { type: 'integer', minimum: 1, maximum: n, description: 'the decision number, each once' },
     option: { type: 'string', description: 'the best other way of deciding, in a few words; empty when no other way meets the goal, every constraint and every example' },
     case: { type: 'string', description: 'why a competent developer could defensibly decide that way: the trade-off it wins, in terms of the code and the goal; empty when option is empty' },
     evidence: { type: 'string', description: 'file:line or a command and its output that the case rests on; empty when option is empty' },
-  }, required: ['decision', 'option', 'case', 'evidence'] } } }, required: ['cases'] }
+  }, required: ['decision', 'option', 'case', 'evidence'] } } }, required: ['cases', 'saved_hash'] }
 }
 function advocatePrompt(goal, decisions) {
   const must = JSON.stringify({ goal: goal.goal, done_when: goal.done_when, constraints: goal.constraints, out_of_scope: goal.out_of_scope }, null, 2)
@@ -472,9 +472,61 @@ function buildSpec(change, goal, findings, plan) {
 // The spec is spread over files, each saved once by its author (architecture 5.2.1): the goal, the
 // scout's findings and what code added to them, and the planner's plan. spec.json is only a manifest
 // naming them; every reader rebuilds the full spec in memory, so nothing an agent wrote is re-typed.
-const SPEC_PARTS = ['goal.json', 'scout.json', 'scout-meta.json', 'plan.json', 'advocate.json']
+const SPEC_PARTS = ['goal.json', 'scout.json', 'scout-meta.json', 'plan.json', 'advocate.json', 'spec-index.json']
 const SPEC_FILES = ['spec.json', ...SPEC_PARTS]
 const specManifest = (change, base, title) => ({ v: 2, change, base, title, parts: SPEC_PARTS })
+
+// The index (architecture 5.2.2): the structure every later stage needs from the spec, built by code
+// from the authors' answers while they are in memory, with no sentence of anyone's: item ids and
+// kinds, decisions and whether each is sure, the plan's steps with what they serve and where they
+// touch, and the blob id of each record as its author saved it. Code-made, so any agent may relay it.
+const RECORD_FILES = ['goal.json', 'scout.json', 'advocate.json', 'plan.json']
+function specIndex(spec, hashes) {
+  const kind = id => ({ E: 'example', C: 'constraint', O: 'exclusion', X: 'agreed extra' })[String(id)[0]]
+  const items = [...spec.done_when, ...spec.constraints, ...spec.out_of_scope, ...(spec.agreed_extras || [])].map(i => ({ id: i.id, kind: kind(i.id) }))
+  return {
+    v: 1, change: spec.change, base: spec.base, title: spec.title,
+    items,
+    decisions: spec.decisions.map(d => ({ id: d.id, sure: !!d.sure })),
+    steps: spec.plan.steps.map(s => ({ id: s.id, serves: s.serves, locations: s.locations.map(l => ({ file: l.file, ...(l.lines ? { lines: l.lines } : {}), ...(l.symbol ? { symbol: l.symbol } : {}), change: l.change })) })),
+    hashes: Object.fromEntries(RECORD_FILES.filter(f => hashes && /^[0-9a-f]{40}$/.test(hashes[f] || '')).map(f => [f, hashes[f]])),
+  }
+}
+// What a later stage checks before it trusts an index: its shape, that it is this change's, and that
+// its hashes are blob ids of the record files. The records themselves are compared with git.
+function indexProblems(x, change) {
+  if (!x || typeof x !== 'object') return ['spec-index.json: missing or not an object']
+  const errs = []
+  if (x.v !== 1) errs.push('spec-index.json: expected {"v": 1, ...}')
+  if (x.change !== change) errs.push(`spec-index.json: change is ${x.change}, expected ${change}`)
+  if (!/^[0-9a-f]{40}$/.test(x.base || '')) errs.push('spec-index.json: base must be a commit id')
+  if (!isStr(x.title)) errs.push('spec-index.json: title missing')
+  for (const k of ['items', 'decisions', 'steps']) if (!Array.isArray(x[k])) errs.push(`spec-index.json: ${k} must be a list`)
+  if (Array.isArray(x.steps) && !x.steps.length) errs.push('spec-index.json: at least one step')
+  const h = x.hashes && typeof x.hashes === 'object' ? x.hashes : null
+  if (!h || !/^[0-9a-f]{40}$/.test(h['plan.json'] || '') || !/^[0-9a-f]{40}$/.test(h['scout.json'] || '')) errs.push('spec-index.json: hashes must give the blob id of scout.json and plan.json')
+  if (h) for (const f of Object.keys(h)) if (!RECORD_FILES.includes(f) || !/^[0-9a-f]{40}$/.test(h[f] || '')) errs.push(`spec-index.json: hashes.${f} is not a record file's blob id`)
+  return errs
+}
+// The spec's structure as a later stage's code needs it, from the index alone: ids for the schemas,
+// steps and locations for the mapping, the title for commit subjects. Every text field is absent.
+function specFromIndex(x) {
+  const of = k => x.items.filter(i => i.kind === k).map(i => ({ id: i.id }))
+  return {
+    v: 1, change: x.change, base: x.base, title: x.title,
+    done_when: of('example'), constraints: of('constraint'), out_of_scope: of('exclusion'), agreed_extras: of('agreed extra'),
+    decisions: x.decisions.map(d => ({ id: d.id, sure: d.sure })),
+    plan: { steps: x.steps.map(s => ({ id: s.id, serves: s.serves, locations: s.locations })) },
+  }
+}
+// The index with the goal's own words on its items: what the check's pages may say. The goal is the
+// requester's requirements, not an agent's reasoning, so its text travels; decisions and steps stay
+// ids, and a page names them by number.
+function specWithGoal(index, goal) {
+  const s = specFromIndex(index)
+  const withText = (ids, items) => ids.map(i => { const it = (items || []).find(x => x.id === i.id) || {}; return { ...i, ...(it.text ? { text: it.text } : {}), ...(it.why ? { why: it.why } : {}) } })
+  return { ...s, goal: goal.goal, ...(goal.reading ? { reading: goal.reading } : {}), source_request: goal.source_request, done_when: withText(s.done_when, goal.done_when), constraints: withText(s.constraints, goal.constraints), out_of_scope: withText(s.out_of_scope, goal.out_of_scope), agreed_extras: withText(s.agreed_extras, goal.agreed_extras) }
+}
 
 // texts: each spec file's content by name ('' when missing). A spec.json from before the manifest
 // holds the whole spec and needs no other file; a manifest names the files it has (advocate.json
@@ -530,7 +582,9 @@ function decisionLines(d, when) {
 
 // A page saved without its reasoning (architecture 5.2.1), when the agent saving the full page was
 // refused for copying it: the record files hold the reasoning in full, and the page says so.
-const reasonsLeftOut = files => `*The reasons behind each decision, the alternatives considered and what could change it are left off this page: the agent saving it was not allowed to copy another agent's reasoning. They are in full in ${files.map(f => `\`${f}\``).join(', ')}.*`
+// Why a page carries no reasoning: a refused save (the default), or the design, which never copies
+// another agent's reasoning onto the review (architecture 5.2.2).
+const reasonsLeftOut = (files, why = "the agent saving it was not allowed to copy another agent's reasoning") => `*The reasons behind each decision, the alternatives considered and what could change it are left off this page: ${why}. They are in full in ${files.map(f => `\`${f}\``).join(', ')}.*`
 
 // The spec as a page for the requester and the reviewer: what and why first, then how.
 // With { reasons: false }, the decisions are one line each and the page says where the reasons are.
@@ -864,7 +918,7 @@ function assemble(x) {
   for (const u of unplanned) if (!u.explained_by) exceptions.push({ kind: 'unexplained_deviation', hunks: [u.hunk], where: u.label })
   // Only a claim the change contradicts is an exception. One the change cannot show (a test run,
   // a timing) is listed for a person to confirm, without failing the check.
-  for (const c of x.claims.claims) if (c.status === 'contradicted') exceptions.push({ kind: 'unsupported_claim', claim: c.text })
+  for (const c of x.claims.claims) if (c.status === 'contradicted') exceptions.push({ kind: 'unsupported_claim', claim: c.text || c.id })
   for (const d of x.claims.decision_conflicts) exceptions.push({ kind: 'decision_conflict', entry: d.entry, conflicts_with: d.conflicts_with, reason: d.reason || null })
   const stepExplained = new Map()
   for (const d of x.claims.deviations) if (d.explained_by && d.step) stepExplained.set(d.step, d.explained_by)
@@ -890,7 +944,7 @@ function assemble(x) {
     // Units that serve an agreed extra: requested, and shown in the review as agreed extras.
     agreed: x.units.filter(u => (unitServes.get(u.id) || []).some(id => agreedIds.has(id))).map(u => u.id),
     claims: x.claims.claims,
-    for_a_person: x.claims.claims.filter(c => c.status === 'unverifiable').map(c => ({ claim: c.text, why: c.evidence })),
+    for_a_person: x.claims.claims.filter(c => c.status === 'unverifiable').map(c => ({ claim: c.text || c.id, why: c.evidence })),
     exceptions,
     verdict: exceptions.length === 0 ? 'aligned' : 'exceptions',
   }
@@ -1054,7 +1108,8 @@ function reviewPage(spec, log, check, opts = {}) {
   const all = [...spec.done_when, ...spec.constraints, ...spec.out_of_scope, ...(spec.agreed_extras || [])]
   const words = id => {
     const d = spec.decisions.find(x => x.id === id)
-    if (d) return `the decision to ${oneLine(d.choice).replace(/^[A-Z]/, c => c.toLowerCase())}`
+    // A decision's words are the scout's; when the page has only the index, it names the decision by number.
+    if (d) return d.choice ? `the decision to ${oneLine(d.choice).replace(/^[A-Z]/, c => c.toLowerCase())}` : `decision ${num(d.id)} of the spec`
     const i = all.find(x => x.id === id)
     return i ? `"${oneLine(i.text)}"` : ''
   }
@@ -1092,11 +1147,11 @@ function reviewPage(spec, log, check, opts = {}) {
       case 'step_not_done': {
         const s = ((check.plan && check.plan.steps) || []).find(x => x.id === e.step)
         const p = spec.plan.steps.find(x => x.id === e.step)
-        return ['Plan step not done', p ? p.locations.map(l => `${l.file}${l.lines ? `, lines ${l.lines.start}–${l.lines.end} (before the change)` : ''}`).join('; ') : '', sentence(s && s.note), sentence(p && p.does), 'Not done.']
+        return ['Plan step not done', p ? p.locations.map(l => `${l.file}${l.lines ? `, lines ${l.lines.start}–${l.lines.end} (before the change)` : ''}`).join('; ') : '', sentence(s && s.note), p && p.does ? sentence(p.does) : p ? `Step ${num(p.id)} of the plan, in spec.md.` : '', 'Not done.']
       }
       case 'unsupported_claim': {
-        const c = (check.claims || []).find(x => x.text === e.claim)
-        return ["The builder's claim is contradicted", '', sentence(c && c.evidence), '', `The builder said: "${oneLine(e.claim)}"`]
+        const c = (check.claims || []).find(x => x.id === e.claim || x.text === e.claim)
+        return ["The builder's claim is contradicted", '', sentence(c && c.evidence), '', /^K\d+$/.test(e.claim) ? `Claim ${num(e.claim)} in build.json.` : `The builder said: "${oneLine(e.claim)}"`]
       }
       case 'decision_conflict': {
         const d = b.decisions.find(x => x.id === e.entry)
@@ -1122,7 +1177,7 @@ function reviewPage(spec, log, check, opts = {}) {
   const logged = id => [...b.deviations, ...b.decisions].find(x => x.id === id)
   const explainedRows = ((check.plan && check.plan.unplanned_hunks) || []).filter(u => u.explained_by).map(u => {
     const h = hunks.get(u.hunk); const l = logged(u.explained_by); const u2 = unitOfHunk.get(u.hunk)
-    const reason = !l ? 'The builder logged a reason.' : l.kind === 'deviation' ? `The builder's logged reason: ${cap(sentence(l.because))}` : `The builder's logged decision: ${cap(sentence(l.choice))} ${cap(sentence(l.because))}`
+    const reason = !l ? `The builder logged a reason: entry ${num(u.explained_by)} of build.json.` : l.kind === 'deviation' ? `The builder's logged reason: ${cap(sentence(l.because))}` : `The builder's logged decision: ${cap(sentence(l.choice))} ${cap(sentence(l.because))}`
     return ['Changed outside the plan, with a reason', at(u.hunk), reason, planned(h ? h.file : ''), shows([u.hunk]) || sentence(u2 && u2.summary)]
   })
 
@@ -1138,18 +1193,24 @@ function reviewPage(spec, log, check, opts = {}) {
   const coverage = check.verdict === 'error' ? '' : `All ${total} changed place${total === 1 ? '' : 's'}, in ${files} file${files === 1 ? '' : 's'}, were checked against the spec; none was left unaccounted for. The check judges what the change does, not whether the code is correct beyond the examples.`
   const warnings = [summary, coverage]
   if (n) warnings.push(table(['Item', 'Location', 'Reason', 'What was requested', 'What the outcome was'], [...(check.exceptions || []).map(row), ...explainedRows]))
-  if (check.for_a_person && check.for_a_person.length) warnings.push(`**Not verified.** The builder says the following, and the change alone cannot show it. The person who ran the build should confirm it:\n\n${check.for_a_person.map(c => `- "${oneLine(c.claim)}" ${sentence(c.why)}`).join('\n')}`)
+  if (check.for_a_person && check.for_a_person.length) warnings.push(`**Not verified.** The builder says the following, and the change alone cannot show it. The person who ran the build should confirm it:\n\n${check.for_a_person.map(c => `- ${/^K\d+$/.test(c.claim) ? `Claim ${num(c.claim)} in build.json.` : `"${oneLine(c.claim)}"`} ${sentence(c.why)}`).join('\n')}`)
   parts.push(`## Warnings\n\n${warnings.filter(Boolean).join('\n\n')}`)
 
   // Decisions: the judgment calls of the spec and the builder's own, in full.
-  const decision = (d, origin) => [`### ${sentence(d.choice)}`, ...decisionLines(d, origin)].join('\n')
-  const brief = (d, origin) => `- ${sentence(d.choice)} ${origin}`
-  const calls = spec.decisions.filter(d => d.judgment !== false)
-  if (opts.reasons === false) {
-    const lines = [...calls.map(d => brief(d, 'Made while planning.')), ...b.decisions.map(d => brief(d, 'Made while building.'))]
-    parts.push(`## Decisions\n\nThe choices a competent developer could have made another way.\n\n${lines.length ? `${lines.join('\n')}\n\n${reasonsLeftOut(['scout.json', 'plan.json', 'build.json'])}` : 'None.'}`)
+  // A decision's words are its author's. When the page has only the index (architecture 5.2.2), it
+  // names the decision by number and says which record holds it; the reader opens that file.
+  const name = d => (d.choice ? sentence(d.choice) : /^B/.test(d.id) ? `Entry ${num(d.id)} of build.json.` : `Decision ${num(d.id)} of the spec, in spec.md.`)
+  const decision = (d, origin) => (d.choice ? [`### ${sentence(d.choice)}`, ...decisionLines(d, origin)].join('\n') : `- ${name(d)} ${origin}`)
+  const brief = (d, origin) => `- ${name(d)} ${origin}`
+  // The spec's judgment calls (judgment in a full spec, sure in the index), and the builder's own.
+  const calls = spec.decisions.filter(d => d.judgment !== false && d.sure !== true)
+  const built = b.decisions.length ? b.decisions : ((check.build && check.build.decisions) || []).map(d => ({ id: d.id }))
+  if (opts.reasons === false || built.some(d => !d.choice) || calls.some(d => !d.choice)) {
+    const lines = [...calls.map(d => brief(d, 'Made while planning.')), ...built.map(d => brief(d, 'Made while building.'))]
+    const indexOnly = calls.some(d => !d.choice) || built.some(d => !d.choice)
+    parts.push(`## Decisions\n\nThe choices a competent developer could have made another way.\n\n${lines.length ? `${lines.join('\n')}\n\n${reasonsLeftOut(['scout.json', 'plan.json', 'build.json'], indexOnly ? "this page copies no agent's reasoning, and the spec page, which the pull request carries, has each decision in full" : undefined)}` : 'None.'}`)
   } else {
-    parts.push(`## Decisions\n\nThe choices a competent developer could have made another way, with the reasoning behind each.\n\n${[...calls.map(d => decision(d, 'Made while planning.')), ...b.decisions.map(d => decision(d, 'Made while building.'))].join('\n\n') || 'None.'}`)
+    parts.push(`## Decisions\n\nThe choices a competent developer could have made another way, with the reasoning behind each.\n\n${[...calls.map(d => decision(d, 'Made while planning.')), ...built.map(d => decision(d, 'Made while building.'))].join('\n\n') || 'None.'}`)
   }
   return parts.join('\n\n') + '\n'
 }
@@ -1239,6 +1300,25 @@ async function recordPage(path, full, reduced, phase) {
   log(`${path}: saving the page without the reasoning it carries`)
   return (await recordFile(path, reduced, phase)) ? 'reduced' : false
 }
+
+// A record an author saved itself is verified without a read-back, which would ask another agent to
+// reproduce its author's reasoning (architecture 5.2.2): the author's own blob id against the id two
+// relays compute, and a count of the record's items against the answer's. Prose equality is not
+// proven, and the design says so. Returns {hash, now} (now: the relayed clock, seconds) or {error}.
+const VERIFY_SCHEMA = { type: 'object', properties: { hash: { type: 'string', description: 'stdout of the git hash-object command, verbatim' }, count: { type: 'string', description: 'stdout of the grep command, verbatim' }, now: { type: 'string', description: 'stdout of date +%s, verbatim' } }, required: ['hash', 'count', 'now'] }
+const clockOf = r => (r && /^\d{9,11}$/.test(String(r.now || '').trim()) ? Number(String(r.now).trim()) : null)
+async function verifySave(path, claimed, itemPattern, expected, phase) {
+  const cmd = `Run these commands in the current directory, one at a time, and return each one's standard output verbatim:\nhash: git hash-object -- ${path}\ncount: grep -o -E '${itemPattern}' ${path} | grep -c .\nnow: date +%s`
+  const r = await parallel([1, 2].map(i => () => agent(cmd, { label: `verify ${path} ${i}`, phase, agentType: 'rbb:checker', effort: 'low', schema: VERIFY_SCHEMA })))
+  if (!r[0] || !r[1]) return { error: `${path} could not be verified (a relay failed)` }
+  const hash = r[0].hash.trim(), count = Number(r[0].count.trim())
+  if (hash !== r[1].hash.trim() || count !== Number(r[1].count.trim())) return { error: `${path} could not be verified (the two relays disagreed)` }
+  if (!/^[0-9a-f]{40}$/.test(hash)) return { error: `${path} was not saved` }
+  const said = String(claimed || '').trim()
+  if (hash !== said) return { error: `${path} is not the file its author hashed after saving (${hash.slice(0, 10)} on disk, ${said.slice(0, 10) || 'none'} claimed)` }
+  if (count !== expected) return { error: `${path} holds ${count} items where the answer has ${expected}` }
+  return { hash, now: clockOf(r[0]) }
+}
 // </lib:record>
 
 // check.json is compared as data, so formatting differences in the read-back don't matter.
@@ -1274,14 +1354,14 @@ const factsA = await relay('head and approvals', [
   ['status', `git status --porcelain=v1 -uall -- . ':(exclude).rbb'`],
   ...(none ? [] : [
     ['log', `git log --format='%H %(trailers:key=RBB-Approved,valueonly,separator=%x2C)' -- ${specPaths.join(' ')}`],
-    ['build', `git show HEAD:.rbb/${change}/build.json`],
+    // Only the log's code-made meta is relayed (architecture 5.2.2); the claims judge reads the log itself.
     ['build_meta', `git show HEAD:.rbb/${change}/build-meta.json`],
   ]),
 ])
 if (factsA && factsA.refused) return await fail('permission', `these read-only commands were not allowed to run; allow them and run the check again: ${factsA.refused.join(' ; ')}`)
 if (!factsA) return await fail('facts', 'relays of HEAD, status and the approval log never matched')
 
-let approvals, specText, buildText, factsB = null
+let approvals, specText, metaText, factsB = null
 if (none) {
   let approval = null
   try { approval = JSON.parse(await readTwice(`.rbb/${change}/approval.json`, 'approval')) } catch (e) { approval = null }
@@ -1292,25 +1372,40 @@ if (none) {
   if (!hashed) return await fail('facts', 'relays of the spec hashes never matched')
   const changed = changedSpecFiles(approval, hashed.out.hash)
   if (changed.length) return await fail('spec', `the spec changed after it was approved: ${changed.join(', ')} no longer has its approved hash`)
-  const texts = await parallel(SPEC_FILES.map(f => () => readTwice(`.rbb/${change}/${f}`, f)))
+  // Code reads only what code made, and the goal (architecture 5.2.2); the records stay on disk for the judges.
+  const texts = await parallel(['spec.json', 'spec-index.json', 'goal.json', 'build-meta.json'].map(f => () => readTwice(`.rbb/${change}/${f}`, f)))
   if (texts.some(t => t === null)) return await fail('facts', 'the two reads of a spec file never matched')
-  specText = Object.fromEntries(SPEC_FILES.map((f, n) => [f, texts[n]]))
-  buildText = buildLogText((await readTwice(`.rbb/${change}/build.json`, 'build log')) || '', (await readTwice(`.rbb/${change}/build-meta.json`, 'build meta')) || '')
+  specText = { 'spec.json': texts[0], 'spec-index.json': texts[1], 'goal.json': texts[2] }
+  metaText = texts[3]
   approvals = { latest: `spec hashes, ${approval.hashes['spec.json'].slice(0, 10)}`, unapproved: [] }
 } else {
   approvals = parseLog(factsA.out.log, change)
   if (!approvals.latest) return await fail('facts', `no approval commit for ${change}: the spec has no commit with the trailer RBB-Approved: ${change}`)
-  factsB = await relay('spec', SPEC_FILES.map((f, n) => [`f${n}`, `git show ${approvals.latest}:.rbb/${change}/${f}`]))
+  const codeMade = ['spec.json', 'spec-index.json', 'goal.json']
+  factsB = await relay('spec', codeMade.map((f, n) => [`f${n}`, `git show ${approvals.latest}:.rbb/${change}/${f}`]))
   if (factsB && factsB.refused) return await fail('permission', `these read-only commands were not allowed to run; allow them and run the check again: ${factsB.refused.join(' ; ')}`)
   if (!factsB) return await fail('facts', 'relays of the approved spec never matched')
-  specText = Object.fromEntries(SPEC_FILES.map((f, n) => [f, factsB.out[`f${n}`]]))
-  buildText = buildLogText(factsA.out.build, factsA.out.build_meta)
+  specText = Object.fromEntries(codeMade.map((f, n) => [f, factsB.out[`f${n}`]]))
+  metaText = factsA.out.build_meta
 }
-const builtSpec = specFromTexts(change, specText)
-if (!builtSpec.spec) return await fail('spec', `the approved spec could not be rebuilt: ${builtSpec.error}`)
-const spec = builtSpec.spec
-const specErrors = validateSpec(spec, change)
-if (specErrors.length) return await fail('spec', 'the approved spec does not meet the schema', { spec_errors: specErrors })
+// The spec as code needs it: the index for every id and location, the goal for the items' own words.
+// The records, the scout's and the planner's reasoning, are never relayed: each judge reads them itself.
+const parseJson = t => { try { return t && String(t).trim() ? JSON.parse(t) : null } catch (e) { return null } }
+const manifest = parseJson(specText['spec.json']), index = parseJson(specText['spec-index.json']), goal = parseJson(specText['goal.json'])
+if (!manifest || !Array.isArray(manifest.parts) || !manifest.parts.includes('spec-index.json')) return await fail('spec', 'this spec was drafted before the index existed; draft and approve it again with /rbb:approve')
+const indexErrors = indexProblems(index, change)
+if (indexErrors.length) return await fail('spec', 'the approved spec index does not meet its format', { spec_errors: indexErrors })
+if (!goal || validateGoal(goal).length) return await fail('spec', 'the approved goal does not meet its format', { spec_errors: goal ? validateGoal(goal) : ['goal.json missing'] })
+if (manifest.base !== index.base) return await fail('spec', 'spec.json and spec-index.json name different base commits')
+const spec = specWithGoal(index, goal)
+const buildMeta = parseJson(metaText)
+const logIndex = buildMeta && buildMeta.index && typeof buildMeta.index === 'object' ? buildMeta.index : null
+if (!logIndex || !Array.isArray(logIndex.deviations) || !Array.isArray(logIndex.claims) || !Array.isArray(logIndex.decisions)) return await fail('build', 'build-meta.json at HEAD is missing or carries no index of the log; build again with /rbb:build')
+// Where the judges read the spec and the log themselves.
+const frozen = none ? `in .rbb/${change}/ (verified unchanged)` : `frozen in commit ${approvals.latest}`
+const show = f => (none ? `Read the file .rbb/${change}/${f}` : `run \`git show ${approvals.latest}:.rbb/${change}/${f}\``)
+const specReading = `The approved spec is ${frozen}; read it yourself before judging: ${show('spec.md')} (the page the requester approved, first), then ${show('goal.json')}, ${show('scout.json')} (the findings and every decision), ${show('plan.json')} (the steps and their locations) and ${show('advocate.json')}. The ids the schema offers you (E1, C1, O1, X1, D1, P1) are the ones these files number.`
+const logReading = `The builder's own log, as committed, is ${none ? `the file .rbb/${change}/build.json: Read it` : `\`git show HEAD:.rbb/${change}/build.json\`: run it`} and verify it; do not trust it. The schema's ids number its entries as code does: its decisions are B1, B2, ... in order, its deviations continue that numbering after the last decision, and its claims are K1, K2, ... in order.`
 
 const factsC = await relay('diff', [
   ['diff', `${DIFF} -U0 ${spec.base} HEAD -- . ':(exclude).rbb'`],
@@ -1326,7 +1421,6 @@ if (crossProblems.length) return await fail('facts', 'the diff and numstat disag
 const plan = planFacts(spec, diffFiles)
 const diffView = annotate(plan.hunks)
 const hunkIds = plan.hunks.map(h => h.id)
-const specView = JSON.stringify({ goal: spec.goal, done_when: spec.done_when, constraints: spec.constraints, out_of_scope: spec.out_of_scope, agreed_extras: spec.agreed_extras || [], decisions: spec.decisions, plan: spec.plan }, null, 2)
 log(`${plan.hunks.length} hunks; ${plan.unplannedHunks.length} outside the plan`)
 
 phase('Judge')
@@ -1362,25 +1456,23 @@ const [adh, map] = await parallel([
 if (!adh || !adh.r || !map || !map.r) return await fail('judge', 'a judging agent did not cover every id exactly once', { coverage: [...((adh && adh.problems) || []), ...((map && map.problems) || [])] })
 const adherence = adh.r, mapping = map.r
 
-function ADHERENCE_PROMPT() { return `Judge whether the change followed each step of the approved plan. Use only the plan, the change and the trace below.\n\nFor each plan step: followed (its changes are made at the locations it named), deviated (it was done, but partly or wholly elsewhere or otherwise than planned), or not_done (its changes are absent). Give one line of evidence each. The evidence is shown to people: name code by file, line and function, and the spec's items in words, never by an id such as a hunk, step or item code.\n\nThe approved spec and plan:\n${specView}\n\nWhich hunks touched each planned location (computed by code):\n${JSON.stringify(plan.trace, null, 2)}\n\nHunks outside every planned location: ${plan.unplannedHunks.join(', ') || 'none'}\n\nThe change:\n\n${diffView}` }
+function ADHERENCE_PROMPT() { return `Judge whether the change followed each step of the approved plan. Use only the plan, the change and the trace below.\n\nFor each plan step: followed (its changes are made at the locations it named), deviated (it was done, but partly or wholly elsewhere or otherwise than planned), or not_done (its changes are absent). Give one line of evidence each. The evidence is shown to people: name code by file, line and function, and the spec's items in words, never by an id such as a hunk, step or item code.\n\n${specReading}\n\nWhich hunks touched each planned location (computed by code):\n${JSON.stringify(plan.trace, null, 2)}\n\nHunks outside every planned location: ${plan.unplannedHunks.join(', ') || 'none'}\n\nThe change:\n\n${diffView}` }
 function MAPPING_PROMPT() { return `Map the change to the approved spec, starting from the spec's side.\n\n- For each done-when item (E...): done, missing, partial or contradicts, or needs_a_person when the change alone cannot settle it, with the ${mode === 'per-hunk' ? 'hunks' : 'units'} that serve it.\n- For each constraint (C...): held or violated by the change.\n- For each ${mode === 'per-hunk' ? 'hunk' : 'unit'}: the E, C, O, X or D items it serves. A change an approved decision (D...) calls for serves that decision. An agreed extra (X...) is something the requester agreed to beyond the request; a ${mode === 'per-hunk' ? 'hunk' : 'unit'} that does one serves it. A ${mode === 'per-hunk' ? 'hunk' : 'unit'} serves an item only if the item needs it; a change that is merely nearby, or a tidy-up nobody asked for, serves nothing. List an out-of-scope item (O...) only if the ${mode === 'per-hunk' ? 'hunk' : 'unit'} does what that item excludes. Leave the list empty if it serves nothing. Only the goal, the requester's words (constraints and agreed extras) or an approved decision make a change in scope; the plan's wording does not.
 - When code satisfies an example, check whether it is general or matches only that example's input; code that special-cases the example does not meet it.
-- For each ${mode === 'per-hunk' ? 'hunk' : 'unit'}, also list its extras: each thing it changes that no item needs, even when the rest of it serves an item. Renaming, reformatting, rewording or restructuring code the change did not need is an extra; so is any behaviour no item asks for. For each extra, give the hunks it is in, and the item it sits next to, or none. New code that the change needs, with comments and docstrings that explain it, is not an extra. In extras and notes, refer to items in words ("the fourth decision"), never by their codes.\n\nThe approved spec:\n${specView}\n\n${mode === 'per-hunk' ? '' : `The units:\n${unitView}\n\n`}The change:\n\n${diffView}` }
+- For each ${mode === 'per-hunk' ? 'hunk' : 'unit'}, also list its extras: each thing it changes that no item needs, even when the rest of it serves an item. Renaming, reformatting, rewording or restructuring code the change did not need is an extra; so is any behaviour no item asks for. For each extra, give the hunks it is in, and the item it sits next to, or none. New code that the change needs, with comments and docstrings that explain it, is not an extra. In extras and notes, refer to items in words ("the fourth decision"), never by their codes.\n\n${specReading}\n\n${mode === 'per-hunk' ? '' : `The units:\n${unitView}\n\n`}The change:\n\n${diffView}` }
 
 // The builder's log was relayed with the git facts from committed HEAD (section 7.1); this step
 // is the first and only one that sees it (ADR-005).
-const build = parseBuild(buildText, spec)
-if (build.errors.length) return await fail('build', 'the builder log at HEAD does not meet its format', { build_errors: build.errors })
-const devIds = build.deviations.map(d => d.id), claimIds = build.claims.map(c => c.id), decisionIds = build.decisions.map(d => d.id)
+// The log's ids come from its code-made index in build-meta.json; the judge reads the log itself.
+const devIds = logIndex.deviations.map(d => d.id), claimIds = logIndex.claims.slice(), decisionIds = logIndex.decisions.map(d => d.id)
 let claims = { deviations: [], claims: [], decision_conflicts: [] }
 if (plan.unplannedHunks.length || claimIds.length || decisionIds.length) {
-  const logView = JSON.stringify({ deviations: build.deviations, decisions: build.decisions, claims: build.claims }, null, 2)
-  const r = await judge('claims', 'high', `You are the last step of the check. Below is the builder's own log, as committed. Verify it; do not trust it.\n\n1. For each hunk outside the plan (${plan.unplannedHunks.join(', ') || 'none'}): the id of the logged deviation, or of the logged decision, that explains it, and the plan step it departs from; null for both if nothing logged explains it. A decision explains a hunk only if it names this place or what was put there, not merely the same topic.\n2. For each logged claim, by its id: supported or contradicted by the change and the verdicts below, or unverifiable when the change cannot show it either way (a test run, a timing, behaviour outside the diff), with one line of evidence. The evidence is shown to people: name code by file, line and function, and the spec's items in words, never by an id such as a hunk, step or item code.\n3. For each logged decision: list it only if it conflicts with a decision (D...) or constraint (C...) of the approved spec.\n\nThe builder's log:\n${logView}\n\nThe approved spec:\n${specView}\n\nVerdicts already fixed (do not change them):\nplan adherence: ${JSON.stringify(adherence.steps)}\nspec mapping: ${JSON.stringify(mapping.items)}\nconstraints: ${JSON.stringify(mapping.constraints)}\n\nThe change:\n\n${diffView}`,
+  const r = await judge('claims', 'high', `You are the last step of the check. Below is the builder's own log, as committed. Verify it; do not trust it.\n\n1. For each hunk outside the plan (${plan.unplannedHunks.join(', ') || 'none'}): the id of the logged deviation, or of the logged decision, that explains it, and the plan step it departs from; null for both if nothing logged explains it. A decision explains a hunk only if it names this place or what was put there, not merely the same topic.\n2. For each logged claim, by its id: supported or contradicted by the change and the verdicts below, or unverifiable when the change cannot show it either way (a test run, a timing, behaviour outside the diff), with one line of evidence. The evidence is shown to people: name code by file, line and function, and the spec's items in words, never by an id such as a hunk, step or item code.\n3. For each logged decision: list it only if it conflicts with a decision (D...) or constraint (C...) of the approved spec.\n\n${logReading}\n\n${specReading}\n\nVerdicts already fixed (do not change them):\nplan adherence: ${JSON.stringify(adherence.steps)}\nspec mapping: ${JSON.stringify(mapping.items)}\nconstraints: ${JSON.stringify(mapping.constraints)}\n\nThe change:\n\n${diffView}`,
     CLAIMS(plan.unplannedHunks, devIds, spec.plan.steps.map(x => x.id), claimIds, decisionIds, [...spec.decisions.map(d => d.id), ...cIds]),
     x => claimsCoverage(plan.unplannedHunks, claimIds, x))
   if (!r.r) return await fail('claims', 'the claims judge did not answer for every unplanned hunk and claim', { coverage: r.problems })
-  const text = new Map(build.claims.map(c => [c.id, c.text]))
-  claims = { ...r.r, claims: r.r.claims.map(c => ({ id: c.id, text: text.get(c.id), status: c.status, evidence: c.evidence })) }
+  // No claim text here: the builder's words stay in build.json, and the review names a claim by its id.
+  claims = { ...r.r, claims: r.r.claims.map(c => ({ id: c.id, status: c.status, evidence: c.evidence })) }
 }
 
 const result = assemble({
@@ -1392,14 +1484,17 @@ const result = assemble({
 })
 result.facts_attempts = { head: factsA.attempts, spec: factsB ? factsB.attempts : null, diff: factsC.attempts }
 result.documents = none ? 'none' : 'committed'
+// The log's index, so that the review can name the builder's entries by id without its text.
+result.build = logIndex
 
 phase('Record')
 result.recorded = await record(result)
 if (!result.recorded) log('check.json could not be verified after two writes')
 // The review page, generated by code from the spec, the build log and this result: what the
 // skill shows the requester, exactly as written.
-let buildLog = null
-try { buildLog = buildText.trim() ? JSON.parse(buildText) : null } catch (e) { buildLog = null }
+// The page carries no entry of the builder's log, which code never saw (architecture 5.2.2): it names
+// the log's entries by id, and the reader opens build.json.
+const buildLog = null
 result.review = `.rbb/${change}/review.md`
 // 'full', or 'reduced' (without the reasoning) when the full page's save is refused (architecture 5.2.1).
 result.review_recorded = await recordPage(result.review, reviewPage(spec, buildLog, result), reviewPage(spec, buildLog, result, { reasons: false }), 'Record')

@@ -5,7 +5,8 @@ export const meta = {
   phases: [
     { title: 'Scout', detail: 'reproduction, impact, conventions, decisions and planned locations, through a schema' },
     { title: 'Review', detail: 'an independent agent keeps only the real alternatives of each decision' },
-    { title: 'Record', detail: 'scout.json written and read back' },
+    { title: 'Record', detail: 'the saves verified by hash and structure; scout-meta.json written' },
+    { title: 'Specify', detail: 'the plan and the spec, drafted by the specify workflow from the findings in memory' },
   ],
 }
 
@@ -404,12 +405,12 @@ function composeFindings(answer, meta, advocate = null) {
 // only add alternatives; a case that meets the bar turns a settled decision into a judgment call.
 const ADVOCATE = { model: 'opus', effort: 'high', alias: true }
 function ADVOCATE_SCHEMA(n) {
-  return { type: 'object', properties: { cases: { type: 'array', minItems: n, maxItems: n, items: { type: 'object', properties: {
+  return { type: 'object', properties: { saved_hash: { type: 'string', description: 'the output of git hash-object on the file you saved, run after saving it: 40 hex characters' }, cases: { type: 'array', minItems: n, maxItems: n, items: { type: 'object', properties: {
     decision: { type: 'integer', minimum: 1, maximum: n, description: 'the decision number, each once' },
     option: { type: 'string', description: 'the best other way of deciding, in a few words; empty when no other way meets the goal, every constraint and every example' },
     case: { type: 'string', description: 'why a competent developer could defensibly decide that way: the trade-off it wins, in terms of the code and the goal; empty when option is empty' },
     evidence: { type: 'string', description: 'file:line or a command and its output that the case rests on; empty when option is empty' },
-  }, required: ['decision', 'option', 'case', 'evidence'] } } }, required: ['cases'] }
+  }, required: ['decision', 'option', 'case', 'evidence'] } } }, required: ['cases', 'saved_hash'] }
 }
 function advocatePrompt(goal, decisions) {
   const must = JSON.stringify({ goal: goal.goal, done_when: goal.done_when, constraints: goal.constraints, out_of_scope: goal.out_of_scope }, null, 2)
@@ -472,9 +473,61 @@ function buildSpec(change, goal, findings, plan) {
 // The spec is spread over files, each saved once by its author (architecture 5.2.1): the goal, the
 // scout's findings and what code added to them, and the planner's plan. spec.json is only a manifest
 // naming them; every reader rebuilds the full spec in memory, so nothing an agent wrote is re-typed.
-const SPEC_PARTS = ['goal.json', 'scout.json', 'scout-meta.json', 'plan.json', 'advocate.json']
+const SPEC_PARTS = ['goal.json', 'scout.json', 'scout-meta.json', 'plan.json', 'advocate.json', 'spec-index.json']
 const SPEC_FILES = ['spec.json', ...SPEC_PARTS]
 const specManifest = (change, base, title) => ({ v: 2, change, base, title, parts: SPEC_PARTS })
+
+// The index (architecture 5.2.2): the structure every later stage needs from the spec, built by code
+// from the authors' answers while they are in memory, with no sentence of anyone's: item ids and
+// kinds, decisions and whether each is sure, the plan's steps with what they serve and where they
+// touch, and the blob id of each record as its author saved it. Code-made, so any agent may relay it.
+const RECORD_FILES = ['goal.json', 'scout.json', 'advocate.json', 'plan.json']
+function specIndex(spec, hashes) {
+  const kind = id => ({ E: 'example', C: 'constraint', O: 'exclusion', X: 'agreed extra' })[String(id)[0]]
+  const items = [...spec.done_when, ...spec.constraints, ...spec.out_of_scope, ...(spec.agreed_extras || [])].map(i => ({ id: i.id, kind: kind(i.id) }))
+  return {
+    v: 1, change: spec.change, base: spec.base, title: spec.title,
+    items,
+    decisions: spec.decisions.map(d => ({ id: d.id, sure: !!d.sure })),
+    steps: spec.plan.steps.map(s => ({ id: s.id, serves: s.serves, locations: s.locations.map(l => ({ file: l.file, ...(l.lines ? { lines: l.lines } : {}), ...(l.symbol ? { symbol: l.symbol } : {}), change: l.change })) })),
+    hashes: Object.fromEntries(RECORD_FILES.filter(f => hashes && /^[0-9a-f]{40}$/.test(hashes[f] || '')).map(f => [f, hashes[f]])),
+  }
+}
+// What a later stage checks before it trusts an index: its shape, that it is this change's, and that
+// its hashes are blob ids of the record files. The records themselves are compared with git.
+function indexProblems(x, change) {
+  if (!x || typeof x !== 'object') return ['spec-index.json: missing or not an object']
+  const errs = []
+  if (x.v !== 1) errs.push('spec-index.json: expected {"v": 1, ...}')
+  if (x.change !== change) errs.push(`spec-index.json: change is ${x.change}, expected ${change}`)
+  if (!/^[0-9a-f]{40}$/.test(x.base || '')) errs.push('spec-index.json: base must be a commit id')
+  if (!isStr(x.title)) errs.push('spec-index.json: title missing')
+  for (const k of ['items', 'decisions', 'steps']) if (!Array.isArray(x[k])) errs.push(`spec-index.json: ${k} must be a list`)
+  if (Array.isArray(x.steps) && !x.steps.length) errs.push('spec-index.json: at least one step')
+  const h = x.hashes && typeof x.hashes === 'object' ? x.hashes : null
+  if (!h || !/^[0-9a-f]{40}$/.test(h['plan.json'] || '') || !/^[0-9a-f]{40}$/.test(h['scout.json'] || '')) errs.push('spec-index.json: hashes must give the blob id of scout.json and plan.json')
+  if (h) for (const f of Object.keys(h)) if (!RECORD_FILES.includes(f) || !/^[0-9a-f]{40}$/.test(h[f] || '')) errs.push(`spec-index.json: hashes.${f} is not a record file's blob id`)
+  return errs
+}
+// The spec's structure as a later stage's code needs it, from the index alone: ids for the schemas,
+// steps and locations for the mapping, the title for commit subjects. Every text field is absent.
+function specFromIndex(x) {
+  const of = k => x.items.filter(i => i.kind === k).map(i => ({ id: i.id }))
+  return {
+    v: 1, change: x.change, base: x.base, title: x.title,
+    done_when: of('example'), constraints: of('constraint'), out_of_scope: of('exclusion'), agreed_extras: of('agreed extra'),
+    decisions: x.decisions.map(d => ({ id: d.id, sure: d.sure })),
+    plan: { steps: x.steps.map(s => ({ id: s.id, serves: s.serves, locations: s.locations })) },
+  }
+}
+// The index with the goal's own words on its items: what the check's pages may say. The goal is the
+// requester's requirements, not an agent's reasoning, so its text travels; decisions and steps stay
+// ids, and a page names them by number.
+function specWithGoal(index, goal) {
+  const s = specFromIndex(index)
+  const withText = (ids, items) => ids.map(i => { const it = (items || []).find(x => x.id === i.id) || {}; return { ...i, ...(it.text ? { text: it.text } : {}), ...(it.why ? { why: it.why } : {}) } })
+  return { ...s, goal: goal.goal, ...(goal.reading ? { reading: goal.reading } : {}), source_request: goal.source_request, done_when: withText(s.done_when, goal.done_when), constraints: withText(s.constraints, goal.constraints), out_of_scope: withText(s.out_of_scope, goal.out_of_scope), agreed_extras: withText(s.agreed_extras, goal.agreed_extras) }
+}
 
 // texts: each spec file's content by name ('' when missing). A spec.json from before the manifest
 // holds the whole spec and needs no other file; a manifest names the files it has (advocate.json
@@ -530,7 +583,9 @@ function decisionLines(d, when) {
 
 // A page saved without its reasoning (architecture 5.2.1), when the agent saving the full page was
 // refused for copying it: the record files hold the reasoning in full, and the page says so.
-const reasonsLeftOut = files => `*The reasons behind each decision, the alternatives considered and what could change it are left off this page: the agent saving it was not allowed to copy another agent's reasoning. They are in full in ${files.map(f => `\`${f}\``).join(', ')}.*`
+// Why a page carries no reasoning: a refused save (the default), or the design, which never copies
+// another agent's reasoning onto the review (architecture 5.2.2).
+const reasonsLeftOut = (files, why = "the agent saving it was not allowed to copy another agent's reasoning") => `*The reasons behind each decision, the alternatives considered and what could change it are left off this page: ${why}. They are in full in ${files.map(f => `\`${f}\``).join(', ')}.*`
 
 // The spec as a page for the requester and the reviewer: what and why first, then how.
 // With { reasons: false }, the decisions are one line each and the page says where the reasons are.
@@ -607,6 +662,7 @@ const str = d => ({ type: 'string', description: d })
 const strs = d => ({ type: 'array', items: { type: 'string' }, description: d })
 const LINES = { type: ['object', 'null'], properties: { start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 0 } }, required: ['start', 'end'] }
 const SCOUT_SCHEMA = { type: 'object', properties: {
+  saved_hash: { type: 'string', description: 'the output of git hash-object on the file you saved, run after saving it: 40 hex characters' },
   reproduction: { type: 'object', properties: {
     outcome: { type: 'string', enum: ['reproduced', 'partly reproduced', 'not reproduced', 'nothing to change', 'not a failure'] },
     observed: str('what you saw, marked observed or inferred'), cause: str('the cause, marked observed or inferred'), evidence: strs('commands and outputs, or file:line'),
@@ -629,7 +685,7 @@ const SCOUT_SCHEMA = { type: 'object', properties: {
   follow_ups: { type: 'array', items: { type: 'object', properties: { text: str(''), evidence: str('') }, required: ['text', 'evidence'] } },
   review_focus: strs('ways the change could fail that no example exercises: each one sentence stating a concrete case (the input or the path, with file:line where it applies) as a fact a reviewer can check; no advice. Empty when the examples cover every way'),
   questions: { type: 'array', items: { type: 'object', properties: { question: str(''), recommendation: str(''), why: str('citing the codebase') }, required: ['question', 'recommendation', 'why'] } },
-}, required: ['reproduction', 'impact', 'conventions', 'decisions', 'locations', 'follow_ups', 'review_focus', 'questions'] }
+}, required: ['reproduction', 'impact', 'conventions', 'decisions', 'locations', 'follow_ups', 'review_focus', 'questions', 'saved_hash'] }
 
 // Each proposed location must be one a plan can use (spec-format.md, the plan).
 function locationProblems(locations) {
@@ -640,6 +696,13 @@ function locationProblems(locations) {
     if (needsLines && !(l.lines && l.lines.end >= l.lines.start)) errs.push(`locations[${n}] ${l.file}: lines {start,end} required for ${l.change}`)
   })
   return errs
+}
+
+// Seconds between the relayed clock stamps, phase by phase; null where a stamp is missing. The
+// advocate's span includes the read-back of scout.json before it, the review's the advocate's save.
+function phaseSeconds(s) {
+  const span = (a, b) => (Number.isFinite(s[a]) && Number.isFinite(s[b]) && s[b] >= s[a] ? s[b] - s[a] : null)
+  return { seconds: { total: span('start', 'end'), scout: span('scoutStart', 'scoutEnd'), advocate: span('scoutEnd', 'advocateEnd'), review: span('advocateEnd', 'end') }, by: 'the clock relayed at phase ends; a resumed run repeats cached stamps' }
 }
 
 // </pure>
@@ -681,6 +744,25 @@ async function recordPage(path, full, reduced, phase) {
   log(`${path}: saving the page without the reasoning it carries`)
   return (await recordFile(path, reduced, phase)) ? 'reduced' : false
 }
+
+// A record an author saved itself is verified without a read-back, which would ask another agent to
+// reproduce its author's reasoning (architecture 5.2.2): the author's own blob id against the id two
+// relays compute, and a count of the record's items against the answer's. Prose equality is not
+// proven, and the design says so. Returns {hash, now} (now: the relayed clock, seconds) or {error}.
+const VERIFY_SCHEMA = { type: 'object', properties: { hash: { type: 'string', description: 'stdout of the git hash-object command, verbatim' }, count: { type: 'string', description: 'stdout of the grep command, verbatim' }, now: { type: 'string', description: 'stdout of date +%s, verbatim' } }, required: ['hash', 'count', 'now'] }
+const clockOf = r => (r && /^\d{9,11}$/.test(String(r.now || '').trim()) ? Number(String(r.now).trim()) : null)
+async function verifySave(path, claimed, itemPattern, expected, phase) {
+  const cmd = `Run these commands in the current directory, one at a time, and return each one's standard output verbatim:\nhash: git hash-object -- ${path}\ncount: grep -o -E '${itemPattern}' ${path} | grep -c .\nnow: date +%s`
+  const r = await parallel([1, 2].map(i => () => agent(cmd, { label: `verify ${path} ${i}`, phase, agentType: 'rbb:checker', effort: 'low', schema: VERIFY_SCHEMA })))
+  if (!r[0] || !r[1]) return { error: `${path} could not be verified (a relay failed)` }
+  const hash = r[0].hash.trim(), count = Number(r[0].count.trim())
+  if (hash !== r[1].hash.trim() || count !== Number(r[1].count.trim())) return { error: `${path} could not be verified (the two relays disagreed)` }
+  if (!/^[0-9a-f]{40}$/.test(hash)) return { error: `${path} was not saved` }
+  const said = String(claimed || '').trim()
+  if (hash !== said) return { error: `${path} is not the file its author hashed after saving (${hash.slice(0, 10)} on disk, ${said.slice(0, 10) || 'none'} claimed)` }
+  if (count !== expected) return { error: `${path} holds ${count} items where the answer has ${expected}` }
+  return { hash, now: clockOf(r[0]) }
+}
 // </lib:record>
 
 // <lib:alternatives> copied from src/lib/alternatives.js by tools/sync-lib.mjs; edit the source, not this copy
@@ -721,20 +803,28 @@ if (!goalReady(goal)) return { change, error: 'the goal still has open questions
 
 // The commit the scout explores: its line numbers refer to it, and it becomes the spec's base.
 // Relayed twice and compared, like the check's git facts.
-const HEAD_SCHEMA = { type: 'object', properties: { head: { type: 'string', description: 'stdout of git rev-parse HEAD, verbatim' } }, required: ['head'] }
-const heads = await parallel([1, 2].map(i => () => agent('Run `git rev-parse HEAD` in the current directory and return its standard output verbatim.', { label: `base ${i}`, phase: 'Scout', agentType: 'rbb:checker', effort: 'low', schema: HEAD_SCHEMA })))
+// The clock rides on relays that run anyway: a workflow script cannot read it (Date throws, so that
+// a resumed run can replay cached results), so `date +%s` is relayed at the phase ends, and the
+// durations in scout-meta.json say where the minutes went. A resumed run repeats cached stamps.
+const NOW = { now: { type: 'string', description: 'stdout of date +%s, verbatim' } }
+const stamp = r => (r && /^\d{9,11}$/.test(String(r.now || '').trim()) ? Number(String(r.now).trim()) : null)
+const HEAD_SCHEMA = { type: 'object', properties: { head: { type: 'string', description: 'stdout of git rev-parse HEAD, verbatim' }, ...NOW }, required: ['head', 'now'] }
+const heads = await parallel([1, 2].map(i => () => agent('Run `git rev-parse HEAD` and then `date +%s` in the current directory and return each one\'s standard output verbatim.', { label: `base ${i}`, phase: 'Scout', agentType: 'rbb:checker', effort: 'low', schema: HEAD_SCHEMA })))
+const stamps = { start: stamp(heads[0]) }
 const base = heads.every(h => h && /^[0-9a-f]{40}$/.test(h.head.trim())) && heads[0].head.trim() === heads[1].head.trim() ? heads[0].head.trim() : null
 if (!base) return { change, error: 'could not establish the commit being explored (the two relays of git rev-parse HEAD disagreed or failed)' }
 
 // The scout runs the project's code; the tree must be the same after it as before, or the build
 // would start from files nobody approved. Relayed twice, before and after.
-const STATUS_SCHEMA = { type: 'object', properties: { status: { type: 'string', description: 'stdout of the command, verbatim' } }, required: ['status'] }
+const STATUS_SCHEMA = { type: 'object', properties: { status: { type: 'string', description: 'stdout of the git command, verbatim' }, ...NOW }, required: ['status', 'now'] }
 const treeStatus = async label => {
-  const r = await parallel([1, 2].map(i => () => agent("Run `git status --porcelain=v1 -uall -- . ':(exclude).rbb'` in the current directory and return its standard output verbatim; an empty string if it prints nothing.", { label: `${label} ${i}`, phase: 'Scout', agentType: 'rbb:checker', effort: 'low', schema: STATUS_SCHEMA })))
-  return r.every(x => x) && r[0].status.trim() === r[1].status.trim() ? r[0].status.trim() : null
+  const r = await parallel([1, 2].map(i => () => agent("Run `git status --porcelain=v1 -uall -- . ':(exclude).rbb'` and then `date +%s` in the current directory and return each one's standard output verbatim; an empty string for the git command if it prints nothing.", { label: `${label} ${i}`, phase: 'Scout', agentType: 'rbb:checker', effort: 'low', schema: STATUS_SCHEMA })))
+  return r.every(x => x) && r[0].status.trim() === r[1].status.trim() ? { status: r[0].status.trim(), now: stamp(r[0]) } : null
 }
-const before = await treeStatus('tree before')
-if (before === null) return { change, error: 'could not read git status (the two relays disagreed or failed)' }
+const beforeTree = await treeStatus('tree before')
+if (beforeTree === null) return { change, error: 'could not read git status (the two relays disagreed or failed)' }
+const before = beforeTree.status
+stamps.scoutStart = beforeTree.now
 
 let findings = null, problems = []
 for (let attempt = 1; attempt <= 2 && !findings; attempt++) {
@@ -745,16 +835,22 @@ for (let attempt = 1; attempt <= 2 && !findings; attempt++) {
   if (!problems.length) findings = answer
 }
 if (!findings) return { change, error: 'the scout findings did not meet their format', problems }
-const after = await treeStatus('tree after')
+const afterTree = await treeStatus('tree after')
+const after = afterTree ? afterTree.status : null
+stamps.scoutEnd = afterTree ? afterTree.now : null
 if (after !== before) return { change, error: 'the scout changed files in the repository while exploring; restore them (git status shows which), then run the scout again', before, after }
 
-// The scout saved its own findings. They are read back and must equal its answer; there is no
-// retry, since another agent re-typing them is what Anthropic's reasoning_extraction safeguard refuses.
+// The scout saved its own findings. A read-back would ask another agent to reproduce its reasoning,
+// which the reasoning_extraction safeguard refuses (architecture 5.2.2), so the save is verified by
+// hash and structure: the author's own blob id against two relays' and a count of the record's ids.
+// Prose equality is not proven; the design says so. verifySave is the record library's.
 phase('Record')
-const saved = await agent(`Read the file ${dir}/scout.json and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label: 'read back scout.json', phase: 'Record', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })
-let savedAnswer = null
-try { savedAnswer = saved && saved.content.trim() ? JSON.parse(saved.content) : null } catch (e) { savedAnswer = null }
-if (!savedAnswer || !sameJson(savedAnswer, findings)) return { change, error: `the scout did not save ${dir}/scout.json, or saved something other than its answer`, saved: !!savedAnswer }
+const { saved_hash: scoutHash, ...found } = findings
+// The scout's decisions carry no ids until code composes them: each has one choice.
+const scoutSaved = await verifySave(`${dir}/scout.json`, scoutHash, '"choice" *:', found.decisions.length, 'Record')
+if (scoutSaved.error) return { change, error: scoutSaved.error }
+const hashes = { 'scout.json': scoutSaved.hash }
+findings = found
 
 // An independent advocate argues from the code for the best way of deciding otherwise, for every
 // decision, the settled ones included (architecture 5.1.3). It saves its own cases; a failed or
@@ -765,11 +861,11 @@ let advocate = { v: 1, cases: [] }
 if (findings.decisions.length) {
   const n = findings.decisions.length
   const a = await agent(`${advocatePrompt(goal, findings.decisions)}\n\nWhen your cases are complete, save them to ${advPath} as described in your instructions (one JSON object: {"v": 1, "cases": [...]}, the same cases you then return), then return them.`, { label: 'advocate', phase: 'Advocate', agentType: 'rbb:scout', model: ADVOCATE.model, effort: ADVOCATE.effort, schema: ADVOCATE_SCHEMA(n) })
-  const back = a && !advocateProblems(n, a).length ? await agent(`Read the file ${advPath} and return its content verbatim, without line numbers. If it does not exist, return an empty string.`, { label: 'read back advocate.json', phase: 'Advocate', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA }) : null
-  let savedAdv = null
-  try { savedAdv = back && back.content.trim() ? JSON.parse(back.content) : null } catch (e) { savedAdv = null }
-  if (savedAdv && sameJson(savedAdv.cases, a.cases)) advocate = savedAdv
-  else log(a ? 'the advocate did not save its cases, or saved something else; the spec goes on without them' : 'the advocate returned nothing; the spec goes on without its cases')
+  // The advocate's save is verified as the scout's: by its own hash and the count of its cases.
+  const advSaved = a && !advocateProblems(n, a).length ? await verifySave(advPath, a.saved_hash, '"decision" *:', n, 'Advocate') : null
+  stamps.advocateEnd = advSaved && !advSaved.error ? advSaved.now : null
+  if (advSaved && !advSaved.error) { advocate = { v: 1, cases: a.cases }; hashes['advocate.json'] = advSaved.hash }
+  else log(a ? `the advocate's cases could not be verified (${advSaved ? advSaved.error : 'its answer did not meet its format'}); the spec goes on without them` : 'the advocate returned nothing; the spec goes on without its cases')
 }
 const advocateSaved = advocate.cases.length ? true : await recordFile(advPath, JSON.stringify(advocate, null, 2) + '\n', 'Advocate', t => { try { return sameJson(JSON.parse(t), advocate) } catch (e) { return false } })
 if (!advocateSaved) return { change, error: `${advPath} could not be saved; the spec's files would be incomplete` }
@@ -788,7 +884,19 @@ const advStamp = { model: ADVOCATE.model, effort: ADVOCATE.effort, ...(ADVOCATE.
 const advocateMeta = advocate.cases.length ? { by: advStamp, keep: pre.decisions.map((d, i) => d.alternatives.some(a => a.raised_by === 'advocate' && (!done || reviewed[i].alternatives.includes(a)))) } : null
 
 phase('Record')
-const scoutMeta = { v: 1, base, run: { model: run.model, effort: run.effort, ...(run.alias ? { alias: true } : {}) }, review, advocate: advocateMeta }
+// One short relay closes the clock; the durations are what a person needs to see where the time goes.
+const closing = await agent('Run `date +%s` in the current directory and return its standard output verbatim.', { label: 'clock', phase: 'Record', agentType: 'rbb:checker', effort: 'low', schema: { type: 'object', properties: NOW, required: ['now'] } })
+stamps.end = stamp(closing)
+const took = phaseSeconds(stamps)
+const scoutMeta = { v: 1, base, run: { model: run.model, effort: run.effort, ...(run.alias ? { alias: true } : {}) }, review, advocate: advocateMeta, hashes, took }
 const recorded = await recordFile(`${dir}/scout-meta.json`, JSON.stringify(scoutMeta, null, 2) + '\n', 'Record', t => { try { return sameJson(JSON.parse(t), scoutMeta) } catch (e) { return false } })
 const composed = composeFindings(findings, scoutMeta, advocate)
-return { change, recorded, files: [`${dir}/scout.json`, `${dir}/scout-meta.json`, advPath], locations: composed.locations.length, decisions: composed.decisions.length, judgment_calls: composed.decisions.filter(d => !d.sure).length, raised_by_advocate: composed.decisions.filter(d => d.alternatives.some(a => a.raised_by === 'advocate')).length, questions: composed.questions }
+const result = { change, recorded, took: took.seconds, files: [`${dir}/scout.json`, `${dir}/scout-meta.json`, advPath], locations: composed.locations.length, decisions: composed.decisions.length, judgment_calls: composed.decisions.filter(d => !d.sure).length, raised_by_advocate: composed.decisions.filter(d => d.alternatives.some(a => a.raised_by === 'advocate')).length, questions: composed.questions }
+if (!recorded || composed.questions.length) return result
+
+// The spec is drafted here, inside this run, so that the specify workflow takes the findings, the
+// cases and the meta as values in memory and reads back nothing an author wrote (architecture 5.2.2).
+phase('Specify')
+let spec
+try { spec = await workflow('rbb:specify', { change, model: run.model, effort: run.effort, goal, scout: findings, scoutMeta, advocate }) } catch (e) { spec = { error: `the specify workflow could not run inside the scout: ${e.message}` } }
+return { ...result, spec }
