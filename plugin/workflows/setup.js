@@ -1,10 +1,10 @@
 export const meta = {
-  name: 'conventions',
-  description: "RBB: detect the project's commit-message style and branch naming from its history, ask when unclear, and save .rbb/config.json",
-  whenToUse: 'Started by RBB skills before the first commit RBB makes in a repository; not for direct use.',
+  name: 'setup',
+  description: "RBB: settle once what a repository needs: the documents mode, the permission rules written where the requester chose, the commit style and branch naming from the history, and the test command; saves .rbb/config.json",
+  whenToUse: 'Started by the setup skill, which the goal and approve skills invoke when .rbb/config.json does not exist; not for direct use.',
   phases: [
-    { title: 'Detect', detail: 'recent commit subjects and branch names, relayed from git and counted by code' },
-    { title: 'Record', detail: 'config.json written and read back' },
+    { title: 'Detect', detail: 'history, root listing and settings files relayed twice from git and compared; styles and test commands recognised by code' },
+    { title: 'Record', detail: 'the permission rules, .rbb/.gitignore in mode none, and config.json, each written and read back' },
   ],
 }
 
@@ -594,6 +594,13 @@ function commitSubject(prefix, title) {
 }
 // </lib:spec>
 
+// <lib:conventions> copied from src/lib/conventions.js by tools/sync-lib.mjs; edit the source, not this copy
+// The repository's conventions and RBB's setup (architecture 9.2 and 10): the commit style and the
+// branch naming counted from real history, the test command recognised from the root listing, the
+// permission rules RBB needs, and the merge of those rules into a Claude Code settings file.
+// Pure functions only. Workflow scripts cannot import, so this file is copied into a marked region
+// of each workflow that needs it by tools/sync-lib.mjs; tests/check/unit.mjs fails if any copy differs.
+
 const CONVENTIONAL = /^([a-z]+)(\(([^)]+)\))?!?: \S/
 const CLEAR_YES = 0.7
 const CLEAR_NO = 0.2
@@ -627,8 +634,173 @@ function branchName(style, change) {
   return style && style.kind === 'prefix' ? `${style.prefix}${change}` : change
 }
 
-function toConfig(commit, branch, by, documents) {
-  return { v: 1, ...(documents === 'none' ? { documents: 'none' } : {}), commit: { kind: commit.kind, ...(commit.type ? { type: commit.type } : {}) }, branch: { kind: branch.kind, ...(branch.prefix ? { prefix: branch.prefix } : {}) }, by, evidence: { commit: commit.evidence, branch: branch.evidence } }
+// The permission rule that lets an agent run a command and its arguments: the command's words,
+// then anything. "go test ./..." allows every package, so the rule stops at the sub-command.
+const ruleFor = command => `Bash(${String(command).trim().replace(/\s+\.\/\.\.\.$/, '')}:*)`
+
+// The test commands recognised from the names at the repository's root, first match recommended.
+// `found` names the file that gave the command away, for the question's options.
+const TEST_COMMANDS = [
+  { file: 'poetry.lock', needs: ['pyproject.toml'], command: 'poetry run pytest' },
+  { file: 'uv.lock', needs: ['pyproject.toml'], command: 'uv run pytest' },
+  { file: 'pyproject.toml', command: 'python -m pytest' },
+  { file: 'pytest.ini', command: 'python -m pytest' },
+  { file: 'setup.cfg', command: 'python -m pytest' },
+  { file: 'conftest.py', command: 'python -m pytest' },
+  { file: 'tox.ini', command: 'tox' },
+  { file: 'pnpm-lock.yaml', needs: ['package.json'], command: 'pnpm test' },
+  { file: 'yarn.lock', needs: ['package.json'], command: 'yarn test' },
+  { file: 'bun.lockb', needs: ['package.json'], command: 'bun test' },
+  { file: 'bun.lock', needs: ['package.json'], command: 'bun test' },
+  { file: 'package.json', command: 'npm test' },
+  { file: 'Cargo.toml', command: 'cargo test' },
+  { file: 'go.mod', command: 'go test ./...' },
+  { file: 'pom.xml', command: 'mvn test' },
+  { file: 'gradlew', command: './gradlew test' },
+  { file: 'build.gradle', command: 'gradle test' },
+  { file: 'build.gradle.kts', command: 'gradle test' },
+  { file: 'mix.exs', command: 'mix test' },
+  { pattern: /\.(sln|csproj|fsproj)$/, command: 'dotnet test' },
+]
+
+// rootListing: the names at the root, one per line (git ls-tree --name-only HEAD).
+// makefileTest: grep's output for a `test:` target in the Makefile; empty when there is none.
+function detectTestCommand(rootListing, makefileTest) {
+  const names = new Set(String(rootListing || '').split('\n').map(s => s.trim()).filter(Boolean))
+  const candidates = []
+  const seen = new Set()
+  const add = (command, found) => { if (!seen.has(command)) { seen.add(command); candidates.push({ command, rule: ruleFor(command), found }) } }
+  for (const t of TEST_COMMANDS) {
+    const hit = t.pattern ? [...names].find(n => t.pattern.test(n)) : names.has(t.file) ? t.file : null
+    if (!hit || (t.needs || []).some(n => !names.has(n))) continue
+    // gradle test is for a project without the wrapper; the wrapper is the convention when present.
+    if (t.command === 'gradle test' && names.has('gradlew')) continue
+    add(t.command, hit)
+  }
+  if (String(makefileTest || '').trim()) add('make test', 'Makefile')
+  return { candidates, recommend: candidates.length ? candidates[0].command : null }
+}
+
+// The rules RBB needs so that only decisions ask (architecture 9.2; the user guide's table says who
+// runs what). The commands that are decisions are never here: git rm, git clean, git switch -c,
+// git push, gh.
+const RBB_RULES = [
+  'Skill',
+  ...['goal', 'scout', 'specify', 'setup', 'approve', 'build', 'check', 'pr', 'clear', 'status'].map(w => `Workflow(rbb:${w})`),
+  ...['status', 'log', 'show', 'diff', 'rev-parse', 'hash-object', 'ls-files', 'ls-tree', 'cat-file', 'branch', 'symbolic-ref', 'remote', 'check-ignore', '-c', 'add', 'commit'].map(c => `Bash(git ${c}:*)`),
+  'Bash(tail:*)',
+  'Bash(grep:*)',
+]
+// Every rule to have in force: RBB's own and the test command's, when there is one.
+const permissionRules = testRule => (testRule ? [...RBB_RULES, testRule] : [...RBB_RULES])
+
+// The allow list a settings file holds, or none when it is missing or does not parse.
+function allowList(text) {
+  try {
+    const o = JSON.parse(text)
+    return o && o.permissions && Array.isArray(o.permissions.allow) ? o.permissions.allow.filter(r => typeof r === 'string') : []
+  } catch (e) { return [] }
+}
+
+// The settings file with the missing rules appended to permissions.allow and nothing else changed:
+// `text` is the file as it is ('' when it does not exist), `alsoAllowed` the rules the other project
+// settings file already holds, which need no second copy. A file that does not parse is not touched.
+function mergeAllow(text, rules, alsoAllowed) {
+  let settings = {}
+  if (String(text || '').trim()) {
+    try { settings = JSON.parse(text) } catch (e) { return { error: 'is not valid JSON, so RBB left it alone' } }
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return { error: 'does not hold a JSON object, so RBB left it alone' }
+  }
+  const permissions = settings.permissions && typeof settings.permissions === 'object' && !Array.isArray(settings.permissions) ? settings.permissions : {}
+  const allow = Array.isArray(permissions.allow) ? permissions.allow : []
+  const have = new Set([...allow, ...(alsoAllowed || [])])
+  const added = rules.filter(r => !have.has(r))
+  const next = { ...settings, permissions: { ...permissions, allow: [...allow, ...added] } }
+  return { settings: next, text: JSON.stringify(next, null, 2) + '\n', added }
+}
+
+function toConfig(commit, branch, by, documents, test, permissions) {
+  return {
+    v: 1,
+    ...(documents === 'none' ? { documents: 'none' } : {}),
+    commit: { kind: commit.kind, ...(commit.type ? { type: commit.type } : {}) },
+    branch: { kind: branch.kind, ...(branch.prefix ? { prefix: branch.prefix } : {}) },
+    by,
+    ...(test ? { test: { command: test.command, rule: test.rule, by: test.by } } : {}),
+    ...(permissions ? { permissions } : {}),
+    evidence: { commit: commit.evidence, branch: branch.evidence },
+  }
+}
+// </lib:conventions>
+
+// tail -v -n +1 <files> prints each file under a "==> path <==" header: the files by path.
+function splitTail(text) {
+  const out = {}
+  let cur = null
+  for (const line of String(text || '').split('\n')) {
+    const m = /^==> (.+) <==$/.exec(line)
+    if (m) { cur = m[1].replace(/\\/g, '/').replace(/^\.\//, ''); out[cur] = []; continue }
+    if (cur !== null) out[cur].push(line)
+  }
+  return Object.fromEntries(Object.entries(out).map(([k, v]) => [k, v.join('\n').trim()]))
+}
+
+const SHARED = '.claude/settings.json'
+const LOCAL = '.claude/settings.local.json'
+const TARGETS = [SHARED, LOCAL, 'none']
+
+// The skill passes an object; an agent that passes the argument text itself writes key=value words.
+function parseSetupArgs(args) {
+  if (args && typeof args === 'object') return args
+  const out = {}
+  for (const word of String(args || '').trim().split(/\s+/)) {
+    const m = /^([a-z_]+)=(.+)$/.exec(word)
+    if (m) out[m[1]] = m[2]
+  }
+  return out
+}
+
+// The questions still open after detection, in the shape the goal's questions have, so the skill
+// asks them the same way: the commit style when the history is mixed, the test command when
+// candidates were recognised. An answer given in the arguments closes its question.
+function setupQuestions(commit, tests, given) {
+  const qs = []
+  if (commit.kind === 'unclear' && !['conventional', 'plain'].includes(given.commit_style)) {
+    const { conventional, total } = commit.evidence
+    qs.push({
+      key: 'commit_style',
+      question: `Which commit style should RBB's own commits follow in this repository?`,
+      options: [
+        { option: 'conventional', means: 'subjects like "docs: approve spec for <title>"' },
+        { option: 'plain', means: 'subjects like "Approve spec for <title>"' },
+      ],
+      recommendation: commit.recommend.kind,
+      because: total < 5 ? `only ${total} recent subjects to go by, too few to tell` : `${conventional} of the last ${total} subjects follow Conventional Commits ("fix(scope): ..."), ${conventional / total >= 0.5 ? 'half or more' : 'fewer than half'}`,
+      affects: 'the subject of every commit RBB makes: the approval, the build and the records',
+    })
+  }
+  if (tests.candidates.length && given.test_command === undefined) {
+    qs.push({
+      key: 'test_command',
+      question: 'Which command runs this project\'s tests? RBB allows it, so the scout and the builder are not asked each run.',
+      options: [
+        ...tests.candidates.map(c => ({ option: c.command, means: `${c.found} is at the root; the rule allows ${c.rule}` })),
+        { option: 'none', means: 'no test command is allowed; each run asks you' },
+      ],
+      recommendation: tests.recommend,
+      because: `${tests.candidates[0].found} is at the root of the repository`,
+      affects: 'one permission rule, and nothing else',
+    })
+  }
+  return qs
+}
+
+// The test command settled: from the answer (their own words allowed), else from an existing config.
+function settledTest(given, tests, previous) {
+  const a = given.test_command
+  if (a === 'none') return null
+  if (a) { const c = tests.candidates.find(x => x.command === a.trim()); return c ? { command: c.command, rule: c.rule, by: 'requester' } : { command: a.trim(), rule: ruleFor(a), by: 'requester' } }
+  return previous && previous.test && previous.test.command ? { ...previous.test } : null
 }
 
 // </pure>
@@ -672,32 +844,86 @@ async function recordPage(path, full, reduced, phase) {
 }
 // </lib:record>
 
-const answer = args && args.commit_style
-// Documents mode, chosen once per repository (architecture 9.1).
-const documents = args && args.documents === 'none' ? 'none' : 'committed'
-const RELAY = { type: 'object', properties: { log: { type: 'string' }, branches: { type: 'string' } }, required: ['log', 'branches'] }
-const prompt = "Run these two commands in the current directory and return each one's standard output verbatim; an empty string if one fails.\nlog: git log -50 --format=%s\nbranches: git branch -a --format='%(refname:short)'"
+const given = parseSetupArgs(args)
+const documents = given.documents === 'none' ? 'none' : given.documents === 'committed' ? 'committed' : undefined
+if (given.permissions !== undefined && !TARGETS.includes(given.permissions)) return { error: `permissions must be one of ${TARGETS.join(', ')}` }
+
+const RELAY = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, { type: 'string', description: `stdout of the command labelled ${k}, verbatim` }])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run; empty if all ran' } }, required: [...keys, 'refused'] })
+const cmds = [
+  ['log', 'git log -50 --format=%s'],
+  ['branches', "git branch -a --format='%(refname:short)'"],
+  ['root', 'git ls-tree --name-only HEAD'],
+  ['files', `tail -v -n +1 .rbb/config.json .rbb/.gitignore ${SHARED} ${LOCAL}`],
+  ['make', "grep -n '^test:' Makefile"],
+  ['ignored', `git check-ignore ${LOCAL}`],
+]
+const keys = cmds.map(([k]) => k)
+const prompt = `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label: every character and newline, nothing added, removed or summarised. Return a command's standard output even when it also reports an error, such as one missing file among several: an empty string only when it printed nothing to standard output. If you were not allowed to run a command, return an empty string and list its label under refused.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
 
 phase('Detect')
-const [a, b] = await parallel([1, 2].map(i => () => agent(prompt, { label: `history ${i}`, phase: 'Detect', agentType: 'rbb:checker', effort: 'low', schema: RELAY })))
-if (!a || !b || a.log.trim() !== b.log.trim() || a.branches.trim() !== b.branches.trim()) return { error: 'the two relays of the history disagreed or failed' }
+const [a, b] = await parallel([1, 2].map(i => () => agent(prompt, { label: `repository ${i}`, phase: 'Detect', agentType: 'rbb:checker', effort: 'low', schema: RELAY(keys) })))
+if (!a || !b) return { error: 'a relay of the repository failed' }
+const refused = [...new Set([...(a.refused || []), ...(b.refused || [])])]
+if (refused.length) return { error: `not allowed to run: ${refused.map(k => cmds.find(([x]) => x === k)[1]).join('; ')}` }
+const differ = keys.filter(k => String(a[k] || '').trim() !== String(b[k] || '').trim())
+if (differ.length) return { error: `the two relays of the repository disagreed on: ${differ.join(', ')}` }
+
+const files = splitTail(a.files)
+let previous = null
+try { previous = files['.rbb/config.json'] ? JSON.parse(files['.rbb/config.json']) : null } catch (e) { previous = null }
+const mode = documents || documentsMode(previous)
 const commit = detectCommitStyle(a.log.split('\n'))
 const branch = detectBranchStyle(a.branches.split('\n'))
+const tests = detectTestCommand(a.root, a.make)
+const questions = setupQuestions(commit, tests, given)
+const test = questions.some(q => q.key === 'test_command') ? null : settledTest(given, tests, previous)
+const rules = permissionRules(test && test.rule)
 
-let config
-if (commit.kind !== 'unclear') config = toConfig(commit, branch, 'detected', documents)
-else if (answer === 'conventional' || answer === 'plain') config = toConfig({ ...commit, kind: answer, type: answer === 'conventional' ? (commit.recommend.type || 'docs') : undefined }, branch, 'requester', documents)
-else return {
-  question: {
-    question: `Commit messages in this repository are mixed: ${commit.evidence.conventional} of the last ${commit.evidence.total} follow Conventional Commits ("fix(scope): …"). Which style should RBB's own commits use?`,
-    options: ['conventional', 'plain'],
-    recommendation: commit.recommend.kind,
-  },
+// Where the rules go: the argument, else what an earlier setup chose, else nowhere until asked.
+const target = given.permissions !== undefined ? given.permissions : previous && previous.permissions && previous.permissions.file ? previous.permissions.file : 'none'
+const other = target === SHARED ? LOCAL : SHARED
+
+// Claude Code asks the requester before any agent writes one of its settings files, whatever the
+// permission mode, and a declined write is the likely failure: the recorder reports it, once.
+const WRITE_SCHEMA = { type: 'object', properties: { written: { type: 'boolean', description: 'true when the Write tool reported success' }, refusal: { type: 'string', description: "the tool's error text, verbatim, when the write was refused or needed a permission that was not granted; empty otherwise" } }, required: ['written', 'refusal'] }
+async function writeSettings(path, text, settings) {
+  const wrote = await agent(`Write this content to ${path}. If the Write tool is refused, or asks for a permission that is not granted, do not try again or in another way: report it.\n\n${text}`, { label: `write ${path}`, phase: 'Record', agentType: 'rbb:recorder', effort: 'low', schema: WRITE_SCHEMA })
+  if (!wrote) return `the agent writing ${path} ended with an error; not retried`
+  if (!wrote.written) return `Claude Code did not allow the write of ${path}${wrote.refusal ? ` (${oneLine(wrote.refusal)})` : ''}`
+  const back = await agent(`Read the file ${path} and return its content verbatim, without line numbers.`, { label: `read back ${path}`, phase: 'Record', agentType: 'rbb:checker', effort: 'low', schema: READBACK_SCHEMA })
+  try { if (back && JSON.stringify(JSON.parse(back.content)) === JSON.stringify(settings)) return null } catch (e) { /* not the content written */ }
+  return `${path} could not be read back as written`
 }
 
 phase('Record')
+let permissions = { file: null }
+if (target !== 'none') {
+  const merged = mergeAllow(files[target] || '', rules, allowList(files[other] || ''))
+  if (merged.error) permissions = { file: target, error: `${target} ${merged.error}` }
+  else if (!merged.added.length) permissions = { file: target, added: [] }
+  else {
+    const problem = await writeSettings(target, merged.text, merged.settings)
+    permissions = problem ? { file: target, error: problem } : { file: target, added: merged.added }
+  }
+  if (target === LOCAL) permissions.ignored = String(a.ignored || '').trim() !== ''
+}
+const shown = permissions.file === null || permissions.error ? rules : undefined
+
+if (questions.length) return { questions, permissions, ...(shown ? { rules: shown } : {}), detected: { commit, branch, tests } }
+
 // Mode none: written first, so config.json itself is never seen by git.
-const ignored = documents === 'none' ? await recordFile('.rbb/.gitignore', NONE_GITIGNORE, 'Record') : null
-if (ignored === false) return { error: '.rbb/.gitignore could not be saved and verified, so RBB wrote nothing else' }
+if (mode === 'none' && files['.rbb/.gitignore'] === undefined) {
+  const ignored = await recordFile('.rbb/.gitignore', NONE_GITIGNORE, 'Record')
+  if (ignored !== true) return { error: '.rbb/.gitignore could not be saved and verified, so RBB wrote no config', permissions }
+}
+const style = commit.kind !== 'unclear' ? commit : { ...commit, kind: given.commit_style, type: given.commit_style === 'conventional' ? (commit.recommend.type || 'docs') : undefined }
+const by = commit.kind !== 'unclear' ? 'detected' : 'requester'
+// The config says where the rules went and whether they got there; the error itself names a path on
+// this machine and stays in the result, since config.json may be committed.
+const config = toConfig(style, branch, by, mode, test, { file: permissions.file, written: permissions.file !== null && !permissions.error })
 const recorded = await recordFile('.rbb/config.json', JSON.stringify(config, null, 2) + '\n', 'Record', t => { try { return JSON.stringify(JSON.parse(t)) === JSON.stringify(config) } catch (e) { return false } })
-return { config, recorded, documents }
+if (recorded !== true) return { error: '.rbb/config.json could not be saved and verified', permissions }
+// Nothing is deleted by a step that was not asked to delete: a repository moved from mode none to
+// committed keeps the .gitignore that hides its records until the requester removes it.
+const note = mode === 'committed' && files['.rbb/.gitignore'] !== undefined ? '.rbb/.gitignore, left by documents mode none, still keeps every RBB file out of git: remove it so that the records can be committed' : undefined
+return { config, documents: mode, permissions, ...(shown ? { rules: shown } : {}), ...(note ? { note } : {}) }

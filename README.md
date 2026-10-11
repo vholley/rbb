@@ -1,12 +1,11 @@
 <p align="center">
-  <img src="assets/hero.svg" width="1000" alt="RBB, Record Before Build. Goal, spec approved and frozen, build from the spec alone, check by an agent that never met the builder, pull request with the ask beside the code.">
+  <a href="#start"><img src="assets/hero.svg" width="1000" alt="RBB, Record Before Build. Goal, spec approved and frozen, build from the spec alone, check by an agent that never met the builder, pull request with the ask beside the code."></a>
 </p>
 
 <p align="center">
-  <img alt="Preview" src="https://img.shields.io/badge/preview-e03ed8?style=flat-square&labelColor=050505">&nbsp;&nbsp;
-  <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-35e0e8?style=flat-square&labelColor=050505">&nbsp;&nbsp;
-  <img alt="No runtime" src="https://img.shields.io/badge/runtime-none-8a8a90?style=flat-square&labelColor=050505">&nbsp;&nbsp;
-  <img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-8a8a90?style=flat-square&labelColor=050505">
+  <a href="#status"><img alt="Preview" src="https://img.shields.io/badge/preview-35e0e8?style=flat-square&labelColor=050505"></a>&nbsp;&nbsp;
+  <a href="#install"><img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-e03ed8?style=flat-square&labelColor=050505"></a>&nbsp;&nbsp;
+  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-8a8a90?style=flat-square&labelColor=050505"></a>
 </p>
 
 <p align="center">
@@ -19,7 +18,7 @@
 
 RBB is a Claude Code plugin. Before anything is built, you approve one page that says what will change, why, and how. The builder sees that page and nothing else. A checker that never met the builder compares the result with the page and lists every difference. The reviewer gets the page beside the code.
 
-It needs Claude Code and git. No program, no runtime, no service.
+It needs Claude Code and git, and nothing else.
 
 ## Install
 
@@ -31,7 +30,7 @@ git clone https://github.com/vholley/rbb
 claude --plugin-dir rbb/plugin
 ```
 
-Once per repository, run `/rbb:documents` to choose where records live: committed under `.rbb/<change>/` and removed after the merge, or only on your machine. Then add the [permission rules](docs/using.md#permissions) so that only real decisions ask you. The GitHub CLI, signed in, is needed only to post pull requests from inside RBB.
+The first `/rbb` in a repository [sets it up](docs/using.md#setting-up): where records live, committed under `.rbb/<change>/` and removed after the merge, or only on your machine; where its permission rules go, so that only real decisions ask you; the commit style and the test command, read from the repository and confirmed by you. The GitHub CLI, signed in, is needed only to post pull requests from inside RBB.
 
 ## Start
 
@@ -42,15 +41,15 @@ Once per repository, run `/rbb:documents` to choose where records live: committe
 RBB shapes the goal, explores the code, drafts the page and asks you to approve it. Then it builds, checks and writes the pull request body without asking anything more. You answer a question or two about your intention, each with the real answers and the reason for the recommended one, and you approve once. `/rbb:pr <change> post` opens the pull request when you want it opened; `/rbb` alone resumes a change in progress.
 
 <p align="center">
-  <img src="assets/spec-against-code.svg" width="1000" alt="The approved spec beside the diff. One change serves example 1, one serves decision 1; a third, a helper rename no item of the spec names, is marked not asked for.">
+  <a href="docs/using.md#what-the-review-shows"><img src="assets/spec-against-code.svg" width="1000" alt="The approved spec beside the diff. One change serves example 1, one serves decision 1; a third, a helper rename no item of the spec names, is marked not asked for."></a>
 </p>
 
 ## What you get
 
-- **One page, approved once.** The goal, numbered examples of when it is done, your constraints in your words, what the scout saw when it reproduced the failure, every decision with its reasons and the alternatives an independent advocate raised, and the plan down to the lines it touches.
-- **A build held to the page.** The builder runs each example before and after, makes the smallest change that passes them, and logs every decision and deviation. Its log may say only what `git diff` shows.
-- **A check you did not write.** Every change is labelled with the item it serves, or marked not asked for. The builder's claims are checked against the diff, and a claim the diff cannot show is handed to you to confirm.
-- **A pull request a reviewer can use.** Your template, filled: the goal, each change and where it is, each difference in one line, what no example exercises, and a link to the review.
+- You approve one page, once. It holds the goal, numbered examples of when it is done, your constraints in your words, what the scout saw when it reproduced the failure, every decision with its reasons and the alternatives an independent advocate raised, and the plan down to the lines it touches.
+- The build is held to that page. The builder runs each example before and after, makes the smallest change that passes them, and logs every decision and deviation. Its log may say only what `git diff` shows.
+- A checker you did not write labels every change with the item it serves, or marks it not asked for. The builder's claims are checked against the diff, and a claim the diff cannot show is handed to you to confirm.
+- The pull request body is your template, filled: the goal, each change and where it is, each difference in one line, what no example exercises, and a link to the review. A reviewer who was not in the session reads the change against the ask.
 
 ## Why
 
@@ -63,7 +62,7 @@ RBB writes down what was asked before anything is built, where the agent cannot 
 - That the model's decisions are right. They are shown with their reasons and the other side, and you can reverse them at approval and at review.
 - That no ambiguity remains. Agents find [under half of the gaps](docs/design.md#f5-13) expert maintainers raise. RBB settles or asks about every gap the scout finds and writes its assumptions on the page, so you can catch the rest.
 - That the checker sees everything. Its reach is unmeasured beyond the development runs, and a claim the change alone cannot show is handed to you.
-- That the cost is nothing. A scout with its advocate takes about five minutes, a build, a check and a pull request body a few minutes each, and you read one page per change. Whether that pays for itself is to be measured, not assumed.
+- That the cost is nothing. A scout with its advocate takes about five minutes, a build, a check and a pull request body a few minutes each, and you read one page per change. Whether that pays for itself has not been measured.
 
 The full list is in [docs/design.md](docs/design.md#what-rbb-does-not-claim).
 

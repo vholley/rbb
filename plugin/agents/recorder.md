@@ -1,6 +1,6 @@
 ---
 name: recorder
-description: RBB recorder. Saves a document an RBB workflow has prepared to the path it names, under .rbb/. Started only by RBB workflows.
+description: RBB recorder. Saves a document an RBB workflow has prepared to the path it names, under .rbb/ or, at setup, a Claude Code settings file of the project. Started only by RBB workflows.
 tools: Read, Write
 omitClaudeMd: true
 ---
