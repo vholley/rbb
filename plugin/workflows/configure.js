@@ -486,8 +486,11 @@ function specIndex(spec, hashes) {
   return {
     v: 1, change: spec.change, base: spec.base, title: spec.title,
     items,
-    decisions: spec.decisions.map(d => ({ id: d.id, sure: !!d.sure })),
-    steps: spec.plan.steps.map(s => ({ id: s.id, serves: s.serves, locations: s.locations.map(l => ({ file: l.file, ...(l.lines ? { lines: l.lines } : {}), ...(l.symbol ? { symbol: l.symbol } : {}), change: l.change })) })),
+    // Statements travel; reasons stay in the records. A decision's choice and the options considered
+    // say what was decided, not why; the why, the case for each option and what could change it are
+    // the scout's reasoning, in scout.json and on the spec page.
+    decisions: spec.decisions.map(d => ({ id: d.id, sure: !!d.sure, choice: d.choice, alternatives: (d.alternatives || []).map(a => a.option), ...(d.decided_by ? { decided_by: d.decided_by } : {}) })),
+    steps: spec.plan.steps.map(s => ({ id: s.id, does: s.does, serves: s.serves, locations: s.locations.map(l => ({ file: l.file, ...(l.lines ? { lines: l.lines } : {}), ...(l.symbol ? { symbol: l.symbol } : {}), change: l.change })) })),
     hashes: Object.fromEntries(RECORD_FILES.filter(f => hashes && /^[0-9a-f]{40}$/.test(hashes[f] || '')).map(f => [f, hashes[f]])),
   }
 }
@@ -514,8 +517,8 @@ function specFromIndex(x) {
   return {
     v: 1, change: x.change, base: x.base, title: x.title,
     done_when: of('example'), constraints: of('constraint'), out_of_scope: of('exclusion'), agreed_extras: of('agreed extra'),
-    decisions: x.decisions.map(d => ({ id: d.id, sure: d.sure })),
-    plan: { steps: x.steps.map(s => ({ id: s.id, serves: s.serves, locations: s.locations })) },
+    decisions: x.decisions.map(d => ({ id: d.id, sure: d.sure, judgment: !d.sure, ...(d.choice ? { choice: d.choice } : {}), alternatives: (d.alternatives || []).map(o => (typeof o === 'string' ? { option: o, why_not: '' } : o)), ...(d.decided_by ? { decided_by: d.decided_by } : {}) })),
+    plan: { steps: x.steps.map(s => ({ id: s.id, ...(s.does ? { does: s.does } : {}), serves: s.serves, locations: s.locations })) },
   }
 }
 // The index with the goal's own words on its items: what the check's pages may say. The goal is the
@@ -570,9 +573,12 @@ function decisionLines(d, when) {
   const w = d.decided_by
   const actor = !w ? '' : w.by === 'requester' ? 'the requester' : `${w.model || 'a model'}${w.effort ? ` at ${w.effort} effort` : ''}${w.alias ? ' (model alias)' : ''}`
   const moment = when ? oneLine(when).replace(/^Made\s+/i, '').replace(/\.$/, '') : ''
+  // On a page rendered from the index (architecture 5.2.2) the decision has its choice and its options
+  // but no reason: the why is in the record its author saved, and the line says which.
+  const reasons = d.because ? '' : /^B/.test(d.id || '') ? "the builder's log" : 'the spec page'
   return [
-    `- **Why:** ${stop(d.because)}`,
-    alts.length ? `- **Alternatives considered:**\n${alts.map(a => `  - ${a.raised_by === 'advocate' ? `${oneLine(a.option).replace(/\.$/, '')}: raised by an independent advocate, not weighed by the decider. Its case: ${stop(a.case)}${a.evidence ? ` Evidence: ${stop(a.evidence)}` : ''}` : a.why_not ? `${oneLine(a.option).replace(/\.$/, '')}: not taken because ${lower(stop(a.why_not))}` : stop(a.option)}`).join('\n')}` : '',
+    d.because ? `- **Why:** ${stop(d.because)}` : `- **Why, and what could change this:** in ${reasons}.`,
+    alts.length ? `- **Alternatives considered:**\n${alts.map(a => `  - ${a.raised_by === 'advocate' ? `${oneLine(a.option).replace(/\.$/, '')}: raised by an independent advocate, not weighed by the decider. Its case: ${stop(a.case)}${a.evidence ? ` Evidence:${stop(a.evidence)}` : ''}` : a.why_not ? `${oneLine(a.option).replace(/\.$/, '')}: not taken because ${lower(stop(a.why_not))}` : stop(a.option)}`).join('\n')}` : '',
     d.would_change_if ? `- **What could change this:** ${stop(d.would_change_if)}` : '',
     actor || moment ? `- **Decision by:** ${stop([actor, moment].filter(Boolean).join(', '))}` : '',
     w && w.basis ? `- **Decided by:** ${stop(SETTLED_BY[w.basis] || w.basis)}` : '',
