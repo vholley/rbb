@@ -1288,11 +1288,14 @@ function claimsCoverage(hunkIds, claimIds, r) {
 const str = d => ({ type: 'string', description: d })
 // refused separates a command that was never allowed to run from one that ran and printed nothing:
 // both give an empty string, and two matching empty relays would otherwise pass as an empty change.
-const RELAY = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, str(`stdout of the command labelled ${k}, verbatim`)])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run (refused, denied, or waiting for approval); empty if all ran' } }, required: [...keys, 'refused'] })
+// A relay has three outcomes per command: the output, verbatim; refused, when it was not allowed to
+// run; or too large, when it ran but its output exceeded what a tool call returns and was saved to
+// a file instead, so the agent cannot return it. The third used to be reported as the second.
+const RELAY = keys => ({ type: 'object', properties: { ...Object.fromEntries(keys.map(k => [k, str(`stdout of the command labelled ${k}, verbatim`)])), refused: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands you were not allowed to run (refused, denied, or waiting for approval); empty if all ran' }, too_large: { type: 'array', items: { type: 'string', enum: keys }, description: 'labels of commands that ran but whose output was too large to return and was saved to a file instead; empty otherwise' } }, required: [...keys, 'refused', 'too_large'] })
 const UNITS = { type: 'object', properties: { units: { type: 'array', items: { type: 'object', properties: { id: str('U1, U2, ...'), summary: str('one line: what this unit does'), hunks: { type: 'array', items: str('hunk id') } }, required: ['id', 'summary', 'hunks'] } } }, required: ['units'] }
 
 
-const RELAY_PROMPT = cmds => `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label: every character and newline, nothing added, removed or summarised. Return standard output only: never an error message the command printed instead. If a command prints nothing to standard output, or fails, return an empty string for it. If you were not allowed to run a command (it was refused, denied, or needs approval), return an empty string for it and list its label under refused; a command that ran and exited with an error is not refused.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
+const RELAY_PROMPT = cmds => `Run these commands in the current directory, exactly as written, one at a time, and return each one's standard output verbatim under its label: every character and newline, nothing added, removed or summarised. Return standard output only: never an error message the command printed instead. If a command prints nothing to standard output, or fails, return an empty string for it. If you were not allowed to run a command (it was refused, denied, or needs approval), return an empty string for it and list its label under refused; a command that ran and exited with an error is not refused. If a command ran but its output was too large to be shown to you and was saved to a file instead, return an empty string for it and list its label under too_large, never under refused, and do not read the saved file.\n\n${cmds.map(([k, c]) => `${k}: ${c}`).join('\n')}`
 
 const { change, mode } = parseArgs(args)
 const DIFF = `git -c core.quotepath=false diff --no-renames --no-color --no-ext-diff`
@@ -1307,6 +1310,8 @@ async function relay(label, cmds) {
     const [a, b] = await parallel([1, 2].map(i => () => agent(RELAY_PROMPT(cmds), { label: `${label} ${attempt}.${i}`, phase: 'Facts', agentType: 'rbb:checker', effort: 'low', schema: RELAY(keys) })))
     const refused = [...new Set([...((a && a.refused) || []), ...((b && b.refused) || [])])]
     if (refused.length) return { refused: refused.map(k => cmds.find(([l]) => l === k)[1]) }
+    const tooLarge = [...new Set([...((a && a.too_large) || []), ...((b && b.too_large) || [])])]
+    if (tooLarge.length) return { too_large: tooLarge.map(k => cmds.find(([l]) => l === k)[1]) }
     if (a && b && keys.every(k => canon(a[k]) === canon(b[k]))) return { out: Object.fromEntries(keys.map(k => [k, canon(a[k])])), attempts: attempt }
     log(`${label}: the two relays differ (attempt ${attempt})`)
   }
@@ -1457,14 +1462,24 @@ const show = f => (none ? `Read the file .rbb/${change}/${f}` : `run \`git show 
 const specReading = `The approved spec is ${frozen}; read it yourself before judging: ${show('spec.md')} (the page the requester approved, first), then ${show('goal.json')}, ${show('scout.json')} (the findings and every decision), ${show('plan.json')} (the steps and their locations) and ${show('advocate.json')}. The ids the schema offers you (E1, C1, O1, X1, D1, P1) are the ones these files number.`
 const logReading = `The builder's own log, as committed, is ${none ? `the file .rbb/${change}/build.json: Read it` : `\`git show HEAD:.rbb/${change}/build.json\`: run it`} and verify it; do not trust it. The schema's ids number its entries as code does: its decisions are B1, B2, ... in order, its deviations continue that numbering after the last decision, and its claims are K1, K2, ... in order.`
 
-const factsC = await relay('diff', [
-  ['diff', `${DIFF} -U0 ${spec.base} HEAD -- . ':(exclude).rbb'`],
-  ['numstat', `${DIFF} --numstat ${spec.base} HEAD -- . ':(exclude).rbb'`],
-])
-if (factsC && factsC.refused) return await fail('permission', `these read-only commands were not allowed to run; allow them and run the check again: ${factsC.refused.join(' ; ')}`)
-if (!factsC) return await fail('facts', 'relays of the diff never matched')
+// The diff is relayed one file at a time: a whole change's diff can exceed what a tool call returns
+// (a 79 KB diff did, and was reported as refused), while a single file's rarely does. The numstat,
+// which is small, names the files; the pieces are joined in its order and cross-checked against it.
+const factsN = await relay('numstat', [['numstat', `${DIFF} --numstat ${spec.base} HEAD -- . ':(exclude).rbb'`]])
+if (factsN && factsN.refused) return await fail('permission', `these read-only commands were not allowed to run; allow them and run the check again: ${factsN.refused.join(' ; ')}`)
+if (factsN && factsN.too_large) return await fail('facts', 'the list of changed files is too large for an agent to relay; the change is too large to check in one piece')
+if (!factsN) return await fail('facts', 'relays of the changed files never matched')
 let diffFiles, numstat
-try { diffFiles = parseDiff(factsC.out.diff); numstat = parseNumstat(factsC.out.numstat) } catch (e) { return await fail('facts', e.message) }
+try { numstat = parseNumstat(factsN.out.numstat) } catch (e) { return await fail('facts', e.message) }
+const quoted = p => (/[\s"']/.test(p) ? `"${p.replace(/"/g, '\\"')}"` : p)
+const pieces = await parallel(numstat.map(f => () => relay(`diff ${f.path}`, [['diff', `${DIFF} -U0 ${spec.base} HEAD -- ${quoted(f.path)}`]])))
+const refusedPiece = pieces.find(p => p && p.refused)
+if (refusedPiece) return await fail('permission', `these read-only commands were not allowed to run; allow them and run the check again: ${refusedPiece.refused.join(' ; ')}`)
+const tooLarge = numstat.filter((f, n) => pieces[n] && pieces[n].too_large).map(f => f.path)
+if (tooLarge.length) return await fail('facts', `the diff of ${tooLarge.join(', ')} is too large for an agent to relay even on its own; split the change so that no single file changes that much`)
+if (pieces.some(p => !p)) return await fail('facts', 'relays of the diff never matched')
+const factsC = { attempts: Math.max(1, ...pieces.map(p => p.attempts || 1)) }
+try { diffFiles = parseDiff(pieces.map(p => p.out.diff).filter(Boolean).join('\n')) } catch (e) { return await fail('facts', e.message) }
 const crossProblems = crossCheck(diffFiles, numstat)
 if (crossProblems.length) return await fail('facts', 'the diff and numstat disagree', { cross_check: crossProblems })
 

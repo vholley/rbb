@@ -1027,9 +1027,11 @@ async function writeSettings(path, text, settings) {
 
 // When the write is refused (Claude Code's auto mode denies a settings write without asking), the
 // requester gets commands that write the same merged file, one per shell, to run if they choose.
-const commandsFor = (path, text) => ({
-  bash: `mkdir -p .claude && cat > ${path} <<'EOF'\n${text.trimEnd()}\nEOF`,
-  powershell: `New-Item -ItemType Directory -Force .claude | Out-Null\n[IO.File]::WriteAllText("$PWD/${path}", @'\n${text.trimEnd()}\n'@ + "\`n")`,
+// The commands name the repository by its absolute path: a terminal that is not in the repository
+// would otherwise write the file somewhere else, as one did into a home folder.
+const commandsFor = (path, text, root) => ({
+  bash: `mkdir -p "${root}/.claude" && cat > "${root}/${path}" <<'EOF'\n${text.trimEnd()}\nEOF`,
+  powershell: `New-Item -ItemType Directory -Force "${root}/.claude" | Out-Null\n[IO.File]::WriteAllText("${root}/${path}", @'\n${text.trimEnd()}\n'@ + "\`n")`,
 })
 
 phase('Record')
@@ -1042,7 +1044,7 @@ if (target !== 'none') {
   else {
     const problem = await writeSettings(target, merged.text, merged.settings)
     permissions = problem ? { file: target, error: problem } : { file: target, added: merged.added }
-    if (problem) commands = commandsFor(target, merged.text)
+    if (problem) commands = commandsFor(target, merged.text, String(a.top).trim().replace(/\\/g, '/'))
   }
   if (target === LOCAL) permissions.ignored = String(a.ignored || '').trim() !== ''
 }
