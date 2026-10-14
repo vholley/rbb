@@ -192,6 +192,9 @@ function items(list, withWhy) {
 // The request as written: a plain quoted section, last on the page, readable in any markdown viewer.
 // Its heading is fixed so the reading-length check can leave it out, as is the Examined list's.
 const REQUEST_HEADING = '## The request as written'
+// Implementation decisions (architecture 5.1.4): settled by the scout, one line each, outside the
+// prose the reading limit counts.
+const IMPLEMENTATION_HEADING = '## Implementation decisions'
 // The reading: one sentence saying how the request is taken, first on the page, so that a wrong one
 // is the first thing the requester sees and rejects.
 const READING_HEADING = '## How the request is read'
@@ -205,7 +208,7 @@ const bullets = (list, f = x => oneLine(x)) => (list && list.length ? list.map(x
 // reference sections (what the change touches, what was examined, the request as written), tables,
 // and sub-bullets (evidence, alternatives considered, who decided).
 function readingText(page) {
-  const skip = new Set([IMPACT_HEADING, EXAMINED_HEADING, REQUEST_HEADING])
+  const skip = new Set([IMPACT_HEADING, EXAMINED_HEADING, REQUEST_HEADING, IMPLEMENTATION_HEADING])
   const out = []
   let skipping = false
   for (const line of String(page).split('\n')) {
@@ -317,10 +320,24 @@ function altIds(decisions) {
   return decisions.flatMap((d, i) => (d.alternatives || []).map((_, j) => `${i + 1}.${j + 1}`))
 }
 
+// The two levels of a decision (architecture 5.1.4): a judgment call's alternatives differ in what the
+// requester can observe or in what the goal commits to; an implementation decision's differ only in
+// where code lives, a name, a default no example exercises, how a test is arranged, or the order of
+// steps. Only judgment calls count against the cap, and only they are the requester's to settle.
+const LEVELS = ['judgment call', 'implementation']
+const LEVEL_RULE = 'A judgment call is a decision whose alternatives differ in what the requester can observe or in what the goal commits to: behaviour, scope, the kind or wording of an error, what is documented, whether a test asserting the old behaviour changes, how a result is shaped. An implementation decision is one whose alternatives differ only in where code lives, what a thing is named, a default no example exercises, how a test is sampled or arranged, or the order of steps. A decision the goal itself delegates to the project\'s conventions is an implementation decision whatever its alternatives.'
+// The decisions a review's ids belong to, 1-based, each once, in order.
+const altDecisions = ids => [...new Set(ids.map(id => Number(String(id).split('.')[0])))]
 function ALT_REVIEW_SCHEMA(ids) {
-  return { type: 'object', properties: { verdicts: { type: 'array', minItems: ids.length, maxItems: ids.length, items: { type: 'object', properties: {
-    id: { type: 'string', enum: ids }, keep: { type: 'boolean', description: 'true only for a real alternative' }, why: { type: 'string', description: 'one line' },
-  }, required: ['id', 'keep', 'why'] } } }, required: ['verdicts'] }
+  const ds = altDecisions(ids)
+  return { type: 'object', properties: {
+    verdicts: { type: 'array', minItems: ids.length, maxItems: ids.length, items: { type: 'object', properties: {
+      id: { type: 'string', enum: ids }, keep: { type: 'boolean', description: 'true only for a real alternative' }, why: { type: 'string', description: 'one line' },
+    }, required: ['id', 'keep', 'why'] } },
+    levels: { type: 'array', minItems: ds.length, maxItems: ds.length, description: 'one per decision that has alternatives, judged from the goal alone', items: { type: 'object', properties: {
+      decision: { type: 'integer', enum: ds }, level: { type: 'string', enum: LEVELS }, why: { type: 'string', description: 'one line: what the alternatives change for the requester, or that they change nothing the requester could observe' },
+    }, required: ['decision', 'level', 'why'] } },
+  }, required: ['verdicts', 'levels'] }
 }
 
 // The reviewer sees what the change must achieve, and each choice with its alternatives, but not
@@ -334,6 +351,8 @@ function altReviewPrompt(goal, decisions) {
 
 Drop it if it would break the goal, a constraint or an example; if it is only the opposite of the choice and doing nothing is not defensible; or if the reason given against it is a defect (it would be wrong, broken, inaccurate, or fail) rather than a trade-off a reasonable developer could weigh the other way. Do not judge the choice itself, and add no alternative of your own. Answer for every id, once.
 
+Then judge each decision's level, from the goal alone and whatever the decider called it. ${LEVEL_RULE} Give one line saying what the kept alternatives would change for the requester, or that they change nothing the requester could observe.
+
 What the change must achieve:
 ${must}
 
@@ -345,7 +364,11 @@ function altReviewProblems(ids, answer) {
   const seen = (answer && answer.verdicts || []).map(v => v.id)
   const missing = ids.filter(id => !seen.includes(id))
   const twice = seen.filter((id, n) => seen.indexOf(id) !== n)
-  return [...missing.map(id => `no verdict for ${id}`), ...[...new Set(twice)].map(id => `more than one verdict for ${id}`)]
+  const ds = altDecisions(ids)
+  const levelled = ((answer && answer.levels) || []).map(l => l.decision)
+  const noLevel = ds.filter(d => !levelled.includes(d))
+  const twoLevels = levelled.filter((d, n) => levelled.indexOf(d) !== n)
+  return [...missing.map(id => `no verdict for ${id}`), ...[...new Set(twice)].map(id => `more than one verdict for ${id}`), ...noLevel.map(d => `no level for decision ${d}`), ...[...new Set(twoLevels)].map(d => `more than one level for decision ${d}`)]
 }
 
 // Keeps the alternatives the reviewer kept; the rest move to dropped_alternatives with the reason,
@@ -361,7 +384,9 @@ function applyAltReview(decisions, answer, run) {
     const verdict = (a, j) => by.get(`${i + 1}.${j + 1}`)
     const kept = alts.filter((a, j) => !verdict(a, j) || verdict(a, j).keep)
     const dropped = alts.map((a, j) => [a, verdict(a, j)]).filter(([, v]) => v && !v.keep).map(([a, v]) => ({ ...a, dropped_because: v.why }))
-    return { ...d, alternatives: kept, ...(dropped.length ? { dropped_alternatives: dropped } : {}), ...(d.sure !== undefined ? { sure: d.sure || kept.length === 0 } : {}), alternatives_reviewed_by: who }
+    // The reviewer's level, judged from the goal alone, stands over the decider's (architecture 5.1.4).
+    const lv = ((answer && answer.levels) || []).find(l => l.decision === i + 1)
+    return { ...d, alternatives: kept, ...(dropped.length ? { dropped_alternatives: dropped } : {}), ...(d.sure !== undefined ? { sure: d.sure || kept.length === 0 } : {}), ...(lv ? { level: lv.level, level_by: 'reviewer', level_because: lv.why } : {}), alternatives_reviewed_by: who }
   })
 }
 
@@ -386,10 +411,16 @@ function composeFindings(answer, meta, advocate = null) {
       const raised = c ? [{ option: c.option, why_not: '', case: c.case, evidence: c.evidence, raised_by: 'advocate' }] : []
       const raisedKept = meta.advocate ? (meta.advocate.keep && meta.advocate.keep[n] ? raised : []) : raised
       const all = [...kept, ...raisedKept]
+      // The level (architecture 5.1.4): the reviewer's verdict, recorded by code in the meta, stands over
+      // the scout's own. A judgment call is a decision with a real alternative at the judgment-call
+      // level; an implementation decision is settled by the scout, whatever its alternatives.
+      const reviewedLevel = review && Array.isArray(review.levels) ? review.levels[n] : null
+      const level = LEVELS.includes(reviewedLevel) ? reviewedLevel : LEVELS.includes(d.level) ? d.level : 'judgment call'
       return {
         // A call with no real alternative is not a judgment call, whatever the scout said; one that
-        // gains an alternative, from the scout or the advocate, is a judgment call, whatever it said.
-        id: `D${n + 1}`, choice: d.choice, because: d.because, sure: all.length === 0,
+        // gains an alternative, from the scout or the advocate, is a judgment call when its level is.
+        id: `D${n + 1}`, choice: d.choice, because: d.because, sure: all.length === 0 || level === 'implementation',
+        level, level_by: LEVELS.includes(reviewedLevel) ? 'reviewer' : 'scout', ...(d.level_because ? { level_because: d.level_because } : {}),
         alternatives: all, would_change_if: d.would_change_if,
         decided_by: { by: 'model', model: run.model, effort: run.effort, basis: d.basis, ...(run.alias ? { alias: true } : {}) },
         ...(alts.length || raised.length ? (review ? { alternatives_reviewed_by: review.by } : { alternatives_reviewed: false }) : {}),
@@ -489,7 +520,7 @@ function specIndex(spec, hashes) {
     // Statements travel; reasons stay in the records. A decision's choice and the options considered
     // say what was decided, not why; the why, the case for each option and what could change it are
     // the scout's reasoning, in scout.json and on the spec page.
-    decisions: spec.decisions.map(d => ({ id: d.id, sure: !!d.sure, choice: d.choice, alternatives: (d.alternatives || []).map(a => a.option), ...(d.decided_by ? { decided_by: d.decided_by } : {}) })),
+    decisions: spec.decisions.map(d => ({ id: d.id, sure: !!d.sure, ...(d.level ? { level: d.level, level_by: d.level_by } : {}), choice: d.choice, alternatives: (d.alternatives || []).map(a => a.option), ...(d.decided_by ? { decided_by: d.decided_by } : {}) })),
     steps: spec.plan.steps.map(s => ({ id: s.id, does: s.does, serves: s.serves, locations: s.locations.map(l => ({ file: l.file, ...(l.lines ? { lines: l.lines } : {}), ...(l.symbol ? { symbol: l.symbol } : {}), change: l.change })) })),
     hashes: Object.fromEntries(RECORD_FILES.filter(f => hashes && /^[0-9a-f]{40}$/.test(hashes[f] || '')).map(f => [f, hashes[f]])),
   }
@@ -517,7 +548,7 @@ function specFromIndex(x) {
   return {
     v: 1, change: x.change, base: x.base, title: x.title,
     done_when: of('example'), constraints: of('constraint'), out_of_scope: of('exclusion'), agreed_extras: of('agreed extra'),
-    decisions: x.decisions.map(d => ({ id: d.id, sure: d.sure, judgment: !d.sure, ...(d.choice ? { choice: d.choice } : {}), alternatives: (d.alternatives || []).map(o => (typeof o === 'string' ? { option: o, why_not: '' } : o)), ...(d.decided_by ? { decided_by: d.decided_by } : {}) })),
+    decisions: x.decisions.map(d => ({ id: d.id, sure: d.sure, judgment: !d.sure, ...(d.level ? { level: d.level } : {}), ...(d.choice ? { choice: d.choice } : {}), alternatives: (d.alternatives || []).map(o => (typeof o === 'string' ? { option: o, why_not: '' } : o)), ...(d.decided_by ? { decided_by: d.decided_by } : {}) })),
     plan: { steps: x.steps.map(s => ({ id: s.id, ...(s.does ? { does: s.does } : {}), serves: s.serves, locations: s.locations })) },
   }
 }
@@ -619,7 +650,11 @@ function specPage(s, opts = {}) {
   // Judgment calls first, in full: that is where the reader's attention belongs. A sure decision,
   // with no credible alternative, takes one line (the old RBB's rule).
   const calls = s.decisions.filter(d => d.judgment !== false)
-  const sure = s.decisions.filter(d => d.judgment === false)
+  // Settled decisions: implementation decisions, whose alternatives change nothing the requester could
+  // observe, go in a section of their own outside the counted prose (architecture 5.1.4); the rest had
+  // no credible alternative.
+  const implementation = s.decisions.filter(d => d.judgment === false && d.level === 'implementation' && (d.alternatives || []).length)
+  const sure = s.decisions.filter(d => d.judgment === false && !implementation.includes(d))
   const brief = d => `- **Decision ${num(d.id)}:** ${oneLine(d.choice)}${who(d) ? ` (${who(d)})` : ''}`
   const decisions = [
     calls.length ? (opts.reasons === false ? `### Judgment calls\n\n${calls.map(brief).join('\n')}` : calls.map(decision).join('\n\n')) : '',
@@ -627,6 +662,7 @@ function specPage(s, opts = {}) {
     opts.reasons === false && s.decisions.length ? reasonsLeftOut(['scout.json', 'plan.json']) : '',
   ].filter(Boolean).join('\n\n')
   parts.push(`## Decisions\n\n${decisions || 'None.'}`)
+  if (implementation.length) parts.push(`${IMPLEMENTATION_HEADING}\n\nSettled by the scout from the project's conventions and the smallest change: their alternatives change nothing you could observe. Each is recorded with its reasons; say so at approval if one should be yours.\n\n${implementation.map(d => `${brief(d)}${(d.alternatives || []).length ? ` Instead of: ${d.alternatives.map(a => oneLine(a.option)).join('; ')}.` : ''}`).join('\n')}`)
   parts.push(`## Plan\n\n${s.plan.approach || ''}\n\n${table(['Step', 'What it does', 'Serves', 'Where'], s.plan.steps.map(p => [num(p.id), p.does, refs(p.serves), p.locations.map(where).join('; ')]))}`)
   if (s.amendments && s.amendments.length) parts.push(`## Amendments\n\n${s.amendments.map((a, n) => `${n + 1}. ${typeof a === 'string' ? a : JSON.stringify(a)}`).join('\n')}`)
   parts.push(reviewFocusSection(s), followUpsSection(s), examinedSection(s), requestSection(s.source_request))
@@ -773,7 +809,7 @@ if (answers.length) {
 const ownWords = previous ? answers.filter(a => { const q = (previous.questions || []).find(x => x.question === a.question); return !q || !(q.options || []).some(o => o.option === a.answer) }) : []
 const ownWordsNote = ownWords.length ? `\n\nThese answers are in the requester's own words, not one of the options offered: ${ownWords.map(a => `"${oneLine(a.answer)}"`).join('; ')}. Say in the reading what you take each to mean. If one admits more than one meaning that would change the goal, ask which, with each meaning as an option in one sentence, and settle nothing else on it until then.` : ''
 const task = previous
-  ? `Revise this goal with the requester's answers. When an answer agrees to something beyond the request, record it as an agreed extra (X1, X2...) with why it is here rather than a follow-up. When an answer asks for a change to the spec (the question "What should change in the spec?"), add it to the goal in the requester's own words, never reworded: as a new constraint (C...) when it says what must hold or must not change, as a new example (E...) when it gives an input and a result, as a new exclusion (O...) when it says what not to do; so that the check and the pull request hold it as their request, not as your restatement. Their answers stand; do not ask them again. An answer of "you decide", or bare agreement, means your recommendation. Keep every item that the answers do not change, with its id.\n\nThe goal:\n${JSON.stringify(previous, null, 2)}\n\nThe answers:\n${JSON.stringify(answers, null, 2)}${ownWordsNote}`
+  ? `Revise this goal with the requester's answers. When an answer agrees to something beyond the request, record it as an agreed extra (X1, X2...) with why it is here rather than a follow-up. When an answer delegates decisions to the project's conventions and the smallest change, record it as a constraint (C...) in the requester's words, naming each decision as they named it: the scout then settles those itself. When an answer asks for a change to the spec (the question "What should change in the spec?"), add it to the goal in the requester's own words, never reworded: as a new constraint (C...) when it says what must hold or must not change, as a new example (E...) when it gives an input and a result, as a new exclusion (O...) when it says what not to do; so that the check and the pull request hold it as their request, not as your restatement. Their answers stand; do not ask them again. An answer of "you decide", or bare agreement, means your recommendation. Keep every item that the answers do not change, with its id.\n\nThe goal:\n${JSON.stringify(previous, null, 2)}\n\nThe answers:\n${JSON.stringify(answers, null, 2)}${ownWordsNote}`
   : `Shape this request into a goal. Number examples E1, E2..., constraints C1..., and exclusions O1....\n\nThe request, as the requester wrote it:\n${request}`
 
 let goal = null, problems = []
