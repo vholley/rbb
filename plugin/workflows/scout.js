@@ -728,7 +728,13 @@ const SCOUT_SCHEMA = { type: 'object', properties: {
   }, required: ['file', 'lines', 'symbol', 'change', 'why'] } },
   follow_ups: { type: 'array', items: { type: 'object', properties: { text: str(''), evidence: str('') }, required: ['text', 'evidence'] } },
   review_focus: strs('ways the change could fail that no example exercises: each one sentence stating a concrete case (the input or the path, with file:line where it applies) as a fact a reviewer can check; no advice. Empty when the examples cover every way'),
-  questions: { type: 'array', items: { type: 'object', properties: { question: str(''), recommendation: str(''), why: str('citing the codebase') }, required: ['question', 'recommendation', 'why'] } },
+  questions: { type: 'array', items: { type: 'object', properties: {
+    question: str('the question, naming the piece of the change it is about'),
+    options: { type: 'array', minItems: 2, items: { type: 'object', properties: { option: str('the answer, in a few words'), means: str('what choosing it would mean for the change, in one sentence') }, required: ['option', 'means'] }, description: 'the real answers; when the question asks who chooses or owns something, one of them says that nobody does' },
+    recommendation: str('one of the options, word for word'),
+    why: str('why that one rather than the others, citing the codebase by file and line'),
+    about: str('what the question refers to: the goal item in words, or the file and lines, that the requester should see before answering'),
+  }, required: ['question', 'options', 'recommendation', 'why', 'about'] } },
 }, required: ['reproduction', 'impact', 'conventions', 'decisions', 'locations', 'follow_ups', 'review_focus', 'questions', 'saved_hash'] }
 
 // Each proposed location must be one a plan can use (spec-format.md, the plan).
@@ -747,6 +753,25 @@ function locationProblems(locations) {
 function phaseSeconds(s) {
   const span = (a, b) => (Number.isFinite(s[a]) && Number.isFinite(s[b]) && s[b] >= s[a] ? s[b] - s[a] : null)
   return { seconds: { total: span('start', 'end'), scout: span('scoutStart', 'scoutEnd'), advocate: span('scoutEnd', 'advocateEnd'), review: span('advocateEnd', 'end') }, by: 'the clock relayed at phase ends; a resumed run repeats cached stamps' }
+}
+
+// What a run left behind, from git status before and after it (porcelain v1, -uall): the files it
+// created (untracked, to clean), the tracked files it modified (to restore), and anything else, which
+// RBB does not undo. A status line is two code characters, a space, and the path.
+function leftovers(before, after) {
+  const lines = t => String(t || '').split('\n').filter(Boolean)
+  const was = new Set(lines(before))
+  const out = { created: [], modified: [], other: [] }
+  const path = l => l.slice(3).replace(/^"(.*)"$/, '$1').replace(/^(.*) -> /, '')
+  for (const l of lines(after)) {
+    if (was.has(l)) continue
+    const code = l.slice(0, 2)
+    if (code === '??') out.created.push(path(l))
+    else if (/^[ M][M ]$/.test(code) && code.includes('M')) out.modified.push(path(l))
+    else out.other.push(l.trim())
+  }
+  for (const l of lines(before)) if (!lines(after).includes(l)) out.other.push(`gone: ${l.trim()}`)
+  return out
 }
 
 // </pure>
@@ -885,9 +910,25 @@ for (let attempt = 1; attempt <= 2 && !findings; attempt++) {
 }
 if (!findings) return { change, error: 'the scout findings did not meet their format', problems }
 const afterTree = await treeStatus('tree after')
-const after = afterTree ? afterTree.status : null
+let after = afterTree ? afterTree.status : null
 stamps.scoutEnd = afterTree ? afterTree.now : null
-if (after !== before) return { change, error: 'the scout changed files in the repository while exploring; restore them (git status shows which), then run the scout again', before, after }
+// What the run left behind is removed by the workflow, by exact path, through the committer
+// (architecture 5.6): a file the run created is cleaned, a tracked file it changed is restored, and
+// nothing else is touched. The commands are the kind a person's tools may hold for confirmation, so
+// the skill says so beforehand; a refused removal is reported, never retried.
+let cleaned = []
+if (after !== before && after !== null) {
+  const left = leftovers(before, after)
+  if (left.other.length) return { change, error: `the scout changed the repository in a way RBB does not undo (${left.other.join('; ')}); restore it, then run the scout again`, before, after }
+  const q = p => (/[\s"']/.test(p) ? `"${p.replace(/"/g, '\\"')}"` : p)
+  const cmds = [...(left.created.length ? [`git clean -f -- ${left.created.map(q).join(' ')}`] : []), ...(left.modified.length ? [`git checkout -- ${left.modified.map(q).join(' ')}`] : [])]
+  await agent(`Run these commands:\n${cmds.map((c, n) => `${n + 1}. ${c}`).join('\n')}`, { label: 'remove leftovers', phase: 'Scout', agentType: 'rbb:committer', effort: 'low' })
+  const again = await treeStatus('tree after cleanup')
+  after = again ? again.status : null
+  if (after !== before) return { change, error: `the scout's run left files in the repository and RBB was not allowed to remove them, or could not: ${[...left.created, ...left.modified].join(', ')}. Remove or restore them, then run the scout again`, left: [...left.created, ...left.modified] }
+  cleaned = [...left.created, ...left.modified]
+  log(`removed what the run left behind: ${cleaned.join(', ')}`)
+}
 
 // The scout saved its own findings. A read-back would ask another agent to reproduce its reasoning,
 // which the reasoning_extraction safeguard refuses (architecture 5.2.2), so the save is verified by
@@ -942,7 +983,7 @@ const took = phaseSeconds(stamps)
 const scoutMeta = { v: 1, base, run: { model: run.model, effort: run.effort, ...(run.alias ? { alias: true } : {}) }, review, advocate: advocateMeta, hashes, took }
 const recorded = await recordFile(`${dir}/scout-meta.json`, JSON.stringify(scoutMeta, null, 2) + '\n', 'Record', t => { try { return sameJson(JSON.parse(t), scoutMeta) } catch (e) { return false } })
 const composed = composeFindings(findings, scoutMeta, advocate)
-const result = { change, recorded, took: took.seconds, files: [`${dir}/scout.json`, `${dir}/scout-meta.json`, advPath], locations: composed.locations.length, decisions: composed.decisions.length, judgment_calls: composed.decisions.filter(d => !d.sure).length, raised_by_advocate: composed.decisions.filter(d => d.alternatives.some(a => a.raised_by === 'advocate')).length, questions: composed.questions }
+const result = { change, recorded, took: took.seconds, ...(cleaned.length ? { removed: cleaned } : {}), files: [`${dir}/scout.json`, `${dir}/scout-meta.json`, advPath], locations: composed.locations.length, decisions: composed.decisions.length, judgment_calls: composed.decisions.filter(d => !d.sure).length, raised_by_advocate: composed.decisions.filter(d => d.alternatives.some(a => a.raised_by === 'advocate')).length, questions: composed.questions }
 if (!recorded || composed.questions.length) return result
 
 // The spec is drafted here, inside this run, so that the specify workflow takes the findings, the

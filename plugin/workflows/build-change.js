@@ -1067,4 +1067,15 @@ await agent(`Run these commands:\n${cmds.map((c, n) => `${n + 1}. ${c}`).join('\
 const v = await relay('verify', [['last', "git log -1 --format='%H %P'"], ['files', 'git show --name-only --format= HEAD']])
 const [sha, parent] = v ? v.last.trim().split(/\s+/) : []
 if (!v || parent !== f1.head.trim()) return { change, error: 'the build commit was not found on top of the approval; check git status', commands: cmds }
-return { change, built: true, commit: sha, subject, files: v.files.trim().split('\n'), decisions: answer.a.decisions.length, deviations: answer.a.deviations.length, ...(stray.length ? { left_untracked: stray, note: 'files the build left in the tree and did not commit; delete them, or add them to the change yourself' } : {}) }
+// What the run left behind is removed by exact path through the committer (architecture 5.6), after
+// the commit, which never took it. A refused removal is reported, never retried.
+let removed = [], left = stray
+if (stray.length) {
+  const q = p => (/[\s"']/.test(p) ? `"${p.replace(/"/g, '\\"')}"` : p)
+  await agent(`Run this command:\n1. git clean -f -- ${stray.map(q).join(' ')}`, { label: 'remove leftovers', phase: 'Commit', agentType: 'rbb:committer', effort: 'low' })
+  const still = await relay('leftovers', [['files', `git -c core.quotepath=false ls-files --others --exclude-standard -- ${stray.map(q).join(' ')}`]])
+  left = still ? still.files.split('\n').map(s => s.trim()).filter(Boolean) : stray
+  removed = stray.filter(f => !left.includes(f))
+  if (removed.length) log(`removed what the run left behind: ${removed.join(', ')}`)
+}
+return { change, built: true, commit: sha, subject, files: v.files.trim().split('\n'), decisions: answer.a.decisions.length, deviations: answer.a.deviations.length, ...(removed.length ? { removed } : {}), ...(left.length ? { left_untracked: left, note: 'files the build left in the tree, which RBB was not allowed to remove or could not; delete them, or add them to the change yourself' } : {}) }

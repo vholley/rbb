@@ -6,6 +6,8 @@ argument-hint: [request, or the name of a change to resume]
 
 Arguments: $ARGUMENTS
 
+Before anything else, if `.rbb/config.json` does not exist, the repository is not set up: invoke the skill `rbb:setup` with the Skill tool and no argument, let it ask and report as it does, and stop if it reported an error. Nothing later in the flow then stops for a setting.
+
 You run the steps in order by invoking RBB's own skills with the Skill tool, one at a time, each with its arguments as that skill expects them. Each skill asks its own questions and shows its own pages, exactly as written, never paraphrased or shortened; you add nothing to them. Stop the flow at the first error any step reports, showing it as written. Never post a pull request, push, or delete anything: the flow ends with the pull request body written.
 
 1. If there is no argument, run the plugin workflow `rbb:derive-status` with the Workflow tool, with args `{}`, and wait. If it found no change, ask for the request and wait, then continue at step 3 with it. Otherwise show its `lines` exactly as written, one per change. With exactly one change, say that you are resuming it and continue at step 2 with its name: no question. With several, ask once with `AskUserQuestion` which to resume: one option per change, labelled with the change name and its stage in a few words ("task-520: built, not checked"), and a last option "Start a new change". On a change, continue at step 2 with its name. On a new change, ask for the request and continue at step 3.
