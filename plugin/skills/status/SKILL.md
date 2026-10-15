@@ -8,4 +8,4 @@ Arguments: $ARGUMENTS
 
 1. Run the plugin workflow `rbb:derive-status` with the Workflow tool, with args `{"change": "<the first argument>"}`, leaving `change` out when there is no argument, and wait. Do not read the record files yourself.
 2. If it returned an error, show it as written and stop.
-3. Show each line of `lines` exactly as written, one per change. If `lines` is empty, say what `note` says. Add nothing of your own: no summary, no advice beyond the line's own "next".
+3. Show each line of `lines` exactly as written, one per change: each ends with what comes next. If `lines` is empty, say what `note` says and that `/rbb <request>` starts a change. Add nothing of your own: no summary, no advice beyond the line's own "next".

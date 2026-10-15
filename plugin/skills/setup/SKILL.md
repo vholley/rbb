@@ -23,3 +23,4 @@ Arguments: $ARGUMENTS
    - when the result has a `note`, the note as written;
    - that the GitHub CLI, signed in, is needed only to post pull requests from inside RBB.
 7. Write no file yourself, and change no setting the workflow did not report.
+8. If another RBB skill invoked you, say nothing more: that skill continues. Otherwise end with the next step, one line: `/rbb <request>` runs the whole flow for a change, or `/rbb:goal <request>` shapes its goal alone; `/rbb:setup` again changes a setting.

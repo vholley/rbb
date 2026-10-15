@@ -49,6 +49,7 @@ RBB shapes the goal, explores the code, drafts the page and asks you to approve 
 - You approve one page, once. It holds the goal, numbered examples of when it is done, your constraints in your words, what the scout saw when it reproduced the failure, every decision with its reasons and the alternatives an independent advocate raised, and the plan down to the lines it touches.
 - The build is held to that page. The builder runs each example before and after, makes the smallest change that passes them, and logs every decision and deviation. Its log may say only what `git diff` shows.
 - A checker you did not write labels every change with the item it serves, or marks it not asked for. The builder's claims are checked against the diff, and a claim the diff cannot show is handed to you to confirm.
+- Each difference the check finds gets your verdict: accept it as an amendment, in your words and frozen like the approval; dispute it before an independent judge, who upholds or withdraws it; or send the builder back to resolve it and check again, by itself until clean if you say so.
 - The pull request body is your template, filled: the goal, each change and where it is, each difference in one line, what a person must still confirm, and a link to the review. A reviewer who was not in the session reads the change against the ask.
 
 ## Why
